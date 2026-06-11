@@ -363,7 +363,8 @@ class PlateTextAggregator:
                 })
 
         # For each group, pick the best representative text:
-        # Prefer the most frequent reading; break ties by confidence
+        # - If one reading is a substring of another (normalized), prefer shorter
+        # - Otherwise prefer the most frequent reading; break ties by shortest
         for group in groups:
             text_counts = {}
             for t, c in group["all_texts"]:
@@ -372,13 +373,31 @@ class PlateTextAggregator:
                 text_counts[t]["count"] += 1
                 text_counts[t]["max_conf"] = max(text_counts[t]["max_conf"], c)
 
-            # Sort by count descending, then confidence descending
-            best_text = max(
-                text_counts.items(),
-                key=lambda x: (x[1]["count"], x[1]["max_conf"]),
-            )
-            group["text"] = best_text[0]
-            group["confidence"] = best_text[1]["max_conf"]
+            unique_texts = list(text_counts.keys())
+
+            # Check substring relationships — shorter is likely correct
+            chosen = None
+            unique_texts_sorted = sorted(unique_texts, key=len)
+            for i, shorter in enumerate(unique_texts_sorted):
+                norm_short = self._normalize(shorter)
+                for j in range(i + 1, len(unique_texts_sorted)):
+                    longer = unique_texts_sorted[j]
+                    norm_long = self._normalize(longer)
+                    if norm_short in norm_long:
+                        chosen = shorter
+                        break
+                if chosen:
+                    break
+
+            if chosen is None:
+                # No substring relation — pick most frequent, then shortest
+                chosen = max(
+                    unique_texts,
+                    key=lambda t: (text_counts[t]["count"], -len(t)),
+                )
+
+            group["text"] = chosen
+            group["confidence"] = text_counts[chosen]["max_conf"]
 
         return groups
 

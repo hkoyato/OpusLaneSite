@@ -78,9 +78,17 @@ def _deduplicate_by_plate(tracks):
         if len(group) == 1:
             merged_tracks.append(group[0])
         else:
-            # Primary = highest confidence reading
-            group.sort(key=lambda t: t.plate_confidence, reverse=True)
+            # Pick the best representative plate text:
+            # - If one plate is a substring of another (after normalization),
+            #   prefer the shorter one (extra chars are noise)
+            # - Otherwise prefer the most frequent reading, then shortest
+            best_plate = _pick_best_plate([t.plate_text for t in group])
+
+            # Use the track with the most hits as primary for timing
+            group.sort(key=lambda t: t.hit_count, reverse=True)
             primary = group[0]
+            primary.plate_text = best_plate
+            primary.plate_confidence = max(t.plate_confidence for t in group)
             for other in group[1:]:
                 primary.first_frame = min(primary.first_frame, other.first_frame)
                 primary.last_frame = max(primary.last_frame, other.last_frame)
@@ -88,6 +96,42 @@ def _deduplicate_by_plate(tracks):
             merged_tracks.append(primary)
 
     return merged_tracks + no_plate_tracks
+
+
+def _pick_best_plate(plate_texts):
+    """
+    From a group of similar plate texts, pick the most likely correct one.
+
+    Rules:
+    - If one is a substring of another (normalized), prefer the shorter —
+      extra characters are almost always OCR noise from adjacent elements.
+    - Among same-length candidates, prefer the most frequent.
+    - Break ties by shortest length (less noise).
+    """
+    if len(plate_texts) == 1:
+        return plate_texts[0]
+
+    # Count frequency of each text
+    freq = {}
+    for t in plate_texts:
+        freq[t] = freq.get(t, 0) + 1
+
+    # Check for substring relationships (normalized)
+    # The shorter plate is more likely correct
+    unique_texts = list(set(plate_texts))
+    unique_texts.sort(key=len)  # shortest first
+
+    for i, shorter in enumerate(unique_texts):
+        norm_short = _normalize_plate(shorter)
+        for j in range(i + 1, len(unique_texts)):
+            longer = unique_texts[j]
+            norm_long = _normalize_plate(longer)
+            if norm_short in norm_long:
+                # Shorter is the real plate, longer has noise chars
+                return shorter
+
+    # No substring relationship — prefer most frequent, then shortest
+    return max(unique_texts, key=lambda t: (freq.get(t, 0), -len(t)))
 
 
 def _plates_are_similar(plate_a, plate_b):
