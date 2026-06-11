@@ -297,6 +297,7 @@ def print_results(tracks, fps):
 
 def process_video(
     video_path,
+    stream_url,
     output_path,
     confidence,
     show,
@@ -306,20 +307,41 @@ def process_video(
     no_ocr,
     display_width,
 ):
-    """Main processing pipeline."""
+    """Main processing pipeline. Handles both file and live stream input."""
+    import time as _time
+
+    # Determine input source
+    is_stream = stream_url is not None
+    source = stream_url if is_stream else video_path
+
+    if not source:
+        print("Error: Provide --video (file) or --stream (RTSP/RTMP URL)")
+        return
+
     # Initialize video capture
-    cap = cv2.VideoCapture(video_path)
+    cap = cv2.VideoCapture(source)
+    if is_stream:
+        # Optimize for live streams: reduce buffer to minimize latency
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
+
     if not cap.isOpened():
-        print(f"Error: Cannot open video file '{video_path}'")
+        print(f"Error: Cannot open {'stream' if is_stream else 'video'}: '{source}'")
         return
 
     fps = cap.get(cv2.CAP_PROP_FPS)
+    if fps <= 0 or is_stream:
+        fps = 25.0  # Default FPS for streams that don't report it
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if not is_stream else -1
 
-    print(f"Video: {video_path}")
-    print(f"Resolution: {width}x{height}, FPS: {fps:.1f}, Frames: {total_frames}")
+    if is_stream:
+        print(f"Stream: {source}")
+        print(f"Resolution: {width}x{height}, FPS: {fps:.1f} (estimated)")
+        print("Press 'q' in the display window to stop.")
+    else:
+        print(f"Video: {source}")
+        print(f"Resolution: {width}x{height}, FPS: {fps:.1f}, Frames: {total_frames}")
     print(f"OCR: {'disabled' if no_ocr else f'enabled (languages={ocr_languages}, interval={ocr_interval} frames)'}")
     print()
 
@@ -349,18 +371,44 @@ def process_video(
         text_aggregator = PlateTextAggregator(min_readings=3, agreement_threshold=0.4)
         print("OCR ready.")
 
-    # Initialize video writer
+    # Initialize video writer (only for file input or if explicitly requested for stream)
     writer = None
-    if output_path:
+    if output_path and not is_stream:
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         writer = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+    elif output_path and is_stream:
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+        print(f"Recording stream to: {output_path}")
 
     frame_idx = 0
+    start_time = _time.time()
+    reconnect_attempts = 0
+    max_reconnect = 5
 
     while True:
         ret, frame = cap.read()
+
         if not ret:
-            break
+            if is_stream:
+                # Stream disconnected — attempt reconnection
+                reconnect_attempts += 1
+                if reconnect_attempts > max_reconnect:
+                    print(f"\nStream lost after {max_reconnect} reconnection attempts.")
+                    break
+                print(f"\nStream interrupted. Reconnecting ({reconnect_attempts}/{max_reconnect})...")
+                _time.sleep(2)
+                cap.release()
+                cap = cv2.VideoCapture(source)
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
+                if cap.isOpened():
+                    print("Reconnected.")
+                    reconnect_attempts = 0
+                continue
+            else:
+                break  # End of file
+
+        reconnect_attempts = 0  # Reset on successful read
 
         # Detect vehicles and plates
         detections = detector.detect(frame)
@@ -391,16 +439,36 @@ def process_video(
         # Draw annotations
         annotated_frame = draw_annotations(frame.copy(), active_tracks)
 
+        # Add stream overlay info
+        if is_stream:
+            elapsed = _time.time() - start_time
+            active_count = sum(
+                1 for t in active_tracks if t.frames_since_seen == 0
+            )
+            overlay = f"LIVE | {elapsed:.0f}s | Vehicles: {active_count} | FPS: {frame_idx / max(elapsed, 0.01):.1f}"
+            cv2.putText(
+                annotated_frame, overlay, (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2,
+            )
+
         # Display progress
         if frame_idx % 30 == 0:
             active_count = sum(
                 1 for t in active_tracks if t.frames_since_seen == 0
             )
-            print(
-                f"\rProcessing frame {frame_idx}/{total_frames} "
-                f"| Active vehicles: {active_count}",
-                end="",
-            )
+            if is_stream:
+                elapsed = _time.time() - start_time
+                print(
+                    f"\r[LIVE] Elapsed: {elapsed:.0f}s | Frame: {frame_idx} "
+                    f"| Active vehicles: {active_count}",
+                    end="",
+                )
+            else:
+                print(
+                    f"\rProcessing frame {frame_idx}/{total_frames} "
+                    f"| Active vehicles: {active_count}",
+                    end="",
+                )
 
         # Write output
         if writer:
@@ -409,7 +477,7 @@ def process_video(
         # Show live preview (resized to fit screen)
         if show:
             display_frame = _resize_for_display(annotated_frame, display_width)
-            cv2.imshow("Vehicle Wait Time Analyzer", display_frame)
+            cv2.imshow("Opus LaneSight", display_frame)
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 print("\nStopped by user.")
                 break
@@ -443,19 +511,28 @@ def process_video(
 
         print_results(all_tracks, fps)
     else:
-        print("No vehicles detected in the video.")
+        print("No vehicles detected.")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Analyze video to detect vehicles, read plates via OCR, "
-        "track with DeepSORT, and calculate wait times."
+        description="Opus LaneSight — Analyze video or live stream to detect vehicles, "
+        "read plates via OCR, track with DeepSORT, and calculate wait times."
     )
-    parser.add_argument(
-        "--video", required=True, help="Path to input video file"
+
+    # Input source (mutually exclusive: file or stream)
+    input_group = parser.add_mutually_exclusive_group(required=True)
+    input_group.add_argument(
+        "--video", help="Path to input video file (MP4, AVI, etc.)"
     )
+    input_group.add_argument(
+        "--stream",
+        help="RTSP/RTMP/HTTP stream URL (e.g., rtsp://user:pass@ip:554/stream)",
+    )
+
     parser.add_argument(
-        "--output", default="output.mp4", help="Path to save annotated video"
+        "--output", default=None,
+        help="Path to save annotated output video (default: output.mp4 for file, none for stream)",
     )
     parser.add_argument(
         "--conf",
@@ -497,9 +574,19 @@ def main():
 
     args = parser.parse_args()
 
+    # Default output path for file mode
+    output = args.output
+    if output is None and args.video:
+        output = "output.mp4"
+
+    # For stream mode, auto-enable show if no output specified
+    if args.stream and not args.output and not args.show:
+        args.show = True
+
     process_video(
         video_path=args.video,
-        output_path=args.output,
+        stream_url=args.stream,
+        output_path=output,
         confidence=args.conf,
         show=args.show,
         plate_model_path=args.plate_model,
