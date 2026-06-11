@@ -5,6 +5,8 @@ Vehicle and license plate detection using YOLOv8.
 from ultralytics import YOLO
 import numpy as np
 
+from plate_detector import PlateDetector
+
 
 # COCO class IDs for vehicles
 VEHICLE_CLASS_IDS = {2, 3, 5, 7}  # car, motorcycle, bus, truck
@@ -15,8 +17,8 @@ class VehicleDetector:
     Detects vehicles and license plates in video frames.
 
     Uses YOLOv8 for vehicle detection. For license plate localization,
-    it uses a secondary YOLO model trained on plates, or falls back to
-    a heuristic region proposal within the vehicle bounding box.
+    uses either a dedicated YOLO plate model or a contour/morphology-based
+    detector that is far more accurate than a simple heuristic.
 
     Parameters
     ----------
@@ -24,7 +26,7 @@ class VehicleDetector:
         Path or name of the YOLOv8 model for vehicles (e.g., 'yolov8n.pt').
     plate_model_path : str or None
         Path to a YOLO model trained for plate detection. If None, uses
-        a heuristic approach to estimate plate location.
+        the contour-based PlateDetector.
     confidence : float
         Minimum confidence threshold for detections.
     """
@@ -37,6 +39,7 @@ class VehicleDetector:
     ):
         self.vehicle_model = YOLO(vehicle_model_path)
         self.plate_model = YOLO(plate_model_path) if plate_model_path else None
+        self.plate_detector = PlateDetector()
         self.confidence = confidence
 
     def detect(self, frame):
@@ -90,9 +93,9 @@ class VehicleDetector:
         """
         Detect license plate within a vehicle bounding box.
 
-        If a plate model is available, runs inference on the cropped region.
-        Otherwise, uses a heuristic: plates are typically in the lower-center
-        portion of the vehicle bounding box.
+        Priority:
+        1. YOLO plate model (if provided) — most accurate
+        2. Contour/morphology-based detection — good fallback
 
         Returns
         -------
@@ -105,44 +108,33 @@ class VehicleDetector:
         if vehicle_crop.size == 0:
             return None
 
+        # Method 1: YOLO plate model
         if self.plate_model is not None:
             plate_results = self.plate_model(
                 vehicle_crop, conf=self.confidence, verbose=False
             )
             for result in plate_results:
                 if result.boxes is not None and len(result.boxes) > 0:
-                    # Take the highest confidence plate detection
                     best_idx = result.boxes.conf.argmax()
                     px1, py1, px2, py2 = (
                         result.boxes.xyxy[best_idx].cpu().numpy().astype(int)
                     )
-                    # Convert back to frame coordinates
                     return (
                         int(x1 + px1),
                         int(y1 + py1),
                         int(x1 + px2),
                         int(y1 + py2),
                     )
-            return None
 
-        # Heuristic fallback: estimate plate in lower-center of vehicle box
-        return self._heuristic_plate_region(vehicle_bbox)
+        # Method 2: Contour-based plate detection
+        plate_region = self.plate_detector.detect(vehicle_crop)
+        if plate_region is not None:
+            px, py, pw, ph = plate_region
+            return (
+                x1 + px,
+                y1 + py,
+                x1 + px + pw,
+                y1 + py + ph,
+            )
 
-    def _heuristic_plate_region(self, vehicle_bbox):
-        """
-        Estimate plate location heuristically.
-
-        Assumes plate is in the lower 30% vertically and center 40% horizontally
-        of the vehicle bounding box.
-        """
-        x1, y1, x2, y2 = vehicle_bbox
-        w = x2 - x1
-        h = y2 - y1
-
-        # Plate is typically in lower portion, center of vehicle
-        plate_x1 = x1 + int(w * 0.3)
-        plate_x2 = x1 + int(w * 0.7)
-        plate_y1 = y1 + int(h * 0.7)
-        plate_y2 = y1 + int(h * 0.9)
-
-        return (plate_x1, plate_y1, plate_x2, plate_y2)
+        return None

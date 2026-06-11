@@ -12,8 +12,18 @@ import numpy as np
 
 from detector import VehicleDetector
 from tracker import VehicleTracker
-from ocr import PlateOCR
+from ocr import PlateOCR, PlateTextAggregator
 from appearance import AppearanceExtractor
+
+
+def _resize_for_display(frame, target_width):
+    """Resize frame to target width while maintaining aspect ratio."""
+    h, w = frame.shape[:2]
+    if w == target_width:
+        return frame
+    scale = target_width / w
+    target_height = int(h * scale)
+    return cv2.resize(frame, (target_width, target_height), interpolation=cv2.INTER_AREA)
 
 
 def draw_annotations(frame, tracks):
@@ -95,6 +105,7 @@ def process_video(
     ocr_languages,
     ocr_interval,
     no_ocr,
+    display_width,
 ):
     """Main processing pipeline."""
     # Initialize video capture
@@ -130,9 +141,11 @@ def process_video(
     appearance_extractor = AppearanceExtractor(feature_dim=128)
 
     plate_ocr = None
+    text_aggregator = None
     if not no_ocr:
         print("Initializing OCR engine...")
         plate_ocr = PlateOCR(languages=ocr_languages, gpu=True)
+        text_aggregator = PlateTextAggregator(min_readings=3, agreement_threshold=0.4)
         print("OCR ready.")
 
     # Initialize video writer
@@ -160,13 +173,19 @@ def process_video(
         # Update tracker with detections and features
         active_tracks = tracker.update(detections, frame_idx, features)
 
-        # Run OCR on plate regions periodically
+        # Run OCR on plate regions periodically with multi-frame voting
         if plate_ocr and frame_idx % ocr_interval == 0:
             for track in active_tracks:
                 if track.frames_since_seen == 0 and track.plate_bbox is not None:
                     text, conf = plate_ocr.read_plate(frame, track.plate_bbox)
                     if text:
-                        track.update_plate_text(text, conf)
+                        text_aggregator.add_reading(track.vehicle_id, text, conf)
+                    # Update track with consensus text
+                    consensus_text, consensus_conf = text_aggregator.get_consensus(
+                        track.vehicle_id
+                    )
+                    if consensus_text:
+                        track.update_plate_text(consensus_text, consensus_conf)
 
         # Draw annotations
         annotated_frame = draw_annotations(frame.copy(), active_tracks)
@@ -186,9 +205,10 @@ def process_video(
         if writer:
             writer.write(annotated_frame)
 
-        # Show live preview
+        # Show live preview (resized to fit screen)
         if show:
-            cv2.imshow("Vehicle Wait Time Analyzer", annotated_frame)
+            display_frame = _resize_for_display(annotated_frame, display_width)
+            cv2.imshow("Vehicle Wait Time Analyzer", display_frame)
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 print("\nStopped by user.")
                 break
@@ -208,6 +228,14 @@ def process_video(
     # Print results
     all_tracks = tracker.get_all_tracks()
     if all_tracks:
+        # Final pass: update all tracks with consensus plate text
+        if text_aggregator:
+            for track in all_tracks:
+                consensus_text, consensus_conf = text_aggregator.get_consensus(
+                    track.vehicle_id
+                )
+                if consensus_text:
+                    track.update_plate_text(consensus_text, consensus_conf)
         print_results(all_tracks, fps)
     else:
         print("No vehicles detected in the video.")
@@ -255,6 +283,12 @@ def main():
         action="store_true",
         help="Disable plate OCR (faster processing)",
     )
+    parser.add_argument(
+        "--display-width",
+        type=int,
+        default=1280,
+        help="Width of the display window in pixels (maintains aspect ratio)",
+    )
 
     args = parser.parse_args()
 
@@ -267,6 +301,7 @@ def main():
         ocr_languages=args.ocr_lang,
         ocr_interval=args.ocr_interval,
         no_ocr=args.no_ocr,
+        display_width=args.display_width,
     )
 
 
