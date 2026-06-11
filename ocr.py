@@ -341,43 +341,87 @@ class PlateTextAggregator:
         return best_group["text"], best_group["confidence"]
 
     def _group_similar(self, readings):
-        """Group readings by similarity using edit distance."""
+        """Group readings by similarity using OCR-aware normalization."""
         groups = []
 
         for text, conf in readings:
             matched = False
             for group in groups:
-                if self._is_similar(text, group["text"]):
+                if self._is_similar(text, group["representative"]):
                     group["count"] += 1
                     group["score"] += conf
-                    # Update representative text if this reading has higher conf
-                    if conf > group["confidence"]:
-                        group["text"] = text
-                        group["confidence"] = conf
+                    group["all_texts"].append((text, conf))
                     matched = True
                     break
 
             if not matched:
                 groups.append({
-                    "text": text,
-                    "confidence": conf,
+                    "representative": text,
                     "count": 1,
                     "score": conf,
+                    "all_texts": [(text, conf)],
                 })
+
+        # For each group, pick the best representative text:
+        # Prefer the most frequent reading; break ties by confidence
+        for group in groups:
+            text_counts = {}
+            for t, c in group["all_texts"]:
+                if t not in text_counts:
+                    text_counts[t] = {"count": 0, "max_conf": 0.0}
+                text_counts[t]["count"] += 1
+                text_counts[t]["max_conf"] = max(text_counts[t]["max_conf"], c)
+
+            # Sort by count descending, then confidence descending
+            best_text = max(
+                text_counts.items(),
+                key=lambda x: (x[1]["count"], x[1]["max_conf"]),
+            )
+            group["text"] = best_text[0]
+            group["confidence"] = best_text[1]["max_conf"]
 
         return groups
 
     def _is_similar(self, text_a, text_b):
-        """Check if two plate texts are similar (edit distance <= 2)."""
+        """
+        Check if two plate texts are similar, accounting for OCR errors.
+        Uses character normalization (1↔7, 0↔O, etc.) before comparing.
+        """
         if abs(len(text_a) - len(text_b)) > 2:
             return False
 
-        # Simple Levenshtein check
-        distance = self._edit_distance(text_a, text_b)
-        max_len = max(len(text_a), len(text_b))
+        # Normalize OCR-confusable characters
+        norm_a = self._normalize(text_a)
+        norm_b = self._normalize(text_b)
+
+        # Exact match after normalization
+        if norm_a == norm_b:
+            return True
+
+        # Substring check (handles extra leading/trailing noise chars)
+        if norm_a in norm_b or norm_b in norm_a:
+            return True
+
+        # Edit distance on normalized text
+        distance = self._edit_distance(norm_a, norm_b)
+        max_len = max(len(norm_a), len(norm_b))
         if max_len == 0:
             return True
-        return distance <= max(2, max_len * 0.3)
+        return distance <= max(2, int(max_len * 0.3))
+
+    def _normalize(self, text):
+        """Normalize OCR-confusable characters to canonical forms."""
+        char_map = {
+            "O": "0",
+            "I": "1",
+            "L": "1",
+            "Z": "2",
+            "S": "5",
+            "B": "8",
+            "G": "6",
+            "7": "1",
+        }
+        return "".join(char_map.get(ch, ch) for ch in text.upper())
 
     def _edit_distance(self, s1, s2):
         """Compute Levenshtein edit distance."""
