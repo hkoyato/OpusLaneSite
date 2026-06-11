@@ -4,10 +4,14 @@ Uses multiple preprocessing pipelines and multi-frame voting
 for robust plate text recognition.
 """
 
+from __future__ import annotations
+
 import cv2
 import numpy as np
 import easyocr
 from collections import Counter
+
+from plate_utils import normalize_plate, edit_distance, align_partial_plates
 
 
 class PlateOCR:
@@ -76,11 +80,13 @@ class PlateOCR:
         # Generate multiple preprocessed versions
         preprocessed_images = self._multi_preprocess(plate_crop)
 
-        # Run OCR on each and collect results
+        # Run OCR on each — early exit if a high-confidence result is found
         all_results = []
         for img in preprocessed_images:
             text, conf = self._run_ocr(img)
             if text:
+                if self._is_valid_plate_text(text, conf) and conf > 0.85:
+                    return text, conf
                 all_results.append((text, conf))
 
         if not all_results:
@@ -275,12 +281,13 @@ class PlateOCR:
 class PlateTextAggregator:
     """
     Aggregates plate text readings across multiple frames for each vehicle.
-    Uses voting to determine the most likely correct plate text.
+    Uses voting and partial plate stitching for robust recognition.
 
-    This is much more reliable than a single-frame reading because:
-    - Motion blur affects different frames differently
+    Handles:
+    - Motion blur affecting different frames differently
     - Lighting changes across frames
-    - OCR may partially read a plate in some frames
+    - Partial occlusion where only part of the plate is visible
+    - Visibility-weighted confidence (occluded readings count less)
 
     Parameters
     ----------
@@ -293,23 +300,31 @@ class PlateTextAggregator:
     def __init__(self, min_readings=3, agreement_threshold=0.4):
         self.min_readings = min_readings
         self.agreement_threshold = agreement_threshold
-        # vehicle_id -> list of (text, confidence)
-        self.readings: dict[int, list[tuple[str, float]]] = {}
+        # vehicle_id -> list of (text, confidence, visibility_weight)
+        self.readings: dict[int, list[tuple[str, float, float]]] = {}
 
-    def add_reading(self, vehicle_id, text, confidence):
-        """Add a new plate reading for a vehicle."""
+    def add_reading(self, vehicle_id, text, confidence, visibility=1.0):
+        """
+        Add a new plate reading for a vehicle.
+
+        Parameters
+        ----------
+        visibility : float
+            How visible the plate was (0-1). Lower when vehicle is partially
+            occluded. Used to downweight unreliable readings.
+        """
         if not text:
             return
         if vehicle_id not in self.readings:
             self.readings[vehicle_id] = []
-        self.readings[vehicle_id].append((text, confidence))
+        self.readings[vehicle_id].append((text, confidence, visibility))
 
     def get_consensus(self, vehicle_id):
         """
         Get the consensus plate text for a vehicle.
 
-        Uses weighted voting: each reading's vote weight = its confidence.
-        Also considers edit-distance similarity to group near-matches.
+        Uses weighted voting where weight = confidence * visibility.
+        Also attempts partial plate stitching when readings are fragments.
 
         Returns
         -------
@@ -323,20 +338,26 @@ class PlateTextAggregator:
 
         readings = self.readings[vehicle_id]
         if len(readings) < self.min_readings:
-            # Not enough readings yet, return best single reading
             if readings:
-                best = max(readings, key=lambda r: r[1])
-                return best
+                best = max(readings, key=lambda r: r[1] * r[2])
+                return best[0], best[1]
             return "", 0.0
 
-        # Group similar readings (allow 1-2 char differences)
+        # Group similar readings
         groups = self._group_similar(readings)
 
         if not groups:
             return "", 0.0
 
-        # Pick the group with highest total weighted confidence
+        # Pick the group with highest total weighted score
         best_group = max(groups, key=lambda g: g["score"])
+
+        # Try partial plate stitching within the best group
+        group_texts = [t for t, _, _ in best_group["all_texts"]]
+        if len(group_texts) >= 2:
+            stitched = align_partial_plates(group_texts)
+            if len(stitched) > len(best_group["text"]):
+                best_group["text"] = stitched
 
         return best_group["text"], best_group["confidence"]
 
@@ -344,13 +365,14 @@ class PlateTextAggregator:
         """Group readings by similarity using OCR-aware normalization."""
         groups = []
 
-        for text, conf in readings:
+        for text, conf, vis in readings:
+            weighted_conf = conf * vis
             matched = False
             for group in groups:
                 if self._is_similar(text, group["representative"]):
                     group["count"] += 1
-                    group["score"] += conf
-                    group["all_texts"].append((text, conf))
+                    group["score"] += weighted_conf
+                    group["all_texts"].append((text, conf, vis))
                     matched = True
                     break
 
@@ -358,16 +380,14 @@ class PlateTextAggregator:
                 groups.append({
                     "representative": text,
                     "count": 1,
-                    "score": conf,
-                    "all_texts": [(text, conf)],
+                    "score": weighted_conf,
+                    "all_texts": [(text, conf, vis)],
                 })
 
-        # For each group, pick the best representative text:
-        # - If one reading is a substring of another (normalized), prefer shorter
-        # - Otherwise prefer the most frequent reading; break ties by shortest
+        # For each group, pick the best representative text
         for group in groups:
             text_counts = {}
-            for t, c in group["all_texts"]:
+            for t, c, v in group["all_texts"]:
                 if t not in text_counts:
                     text_counts[t] = {"count": 0, "max_conf": 0.0}
                 text_counts[t]["count"] += 1
@@ -375,14 +395,13 @@ class PlateTextAggregator:
 
             unique_texts = list(text_counts.keys())
 
-            # Check substring relationships — shorter is likely correct
             chosen = None
             unique_texts_sorted = sorted(unique_texts, key=len)
             for i, shorter in enumerate(unique_texts_sorted):
-                norm_short = self._normalize(shorter)
+                norm_short = normalize_plate(shorter)
                 for j in range(i + 1, len(unique_texts_sorted)):
                     longer = unique_texts_sorted[j]
-                    norm_long = self._normalize(longer)
+                    norm_long = normalize_plate(longer)
                     if norm_short in norm_long:
                         chosen = shorter
                         break
@@ -390,7 +409,6 @@ class PlateTextAggregator:
                     break
 
             if chosen is None:
-                # No substring relation — pick most frequent, then shortest
                 chosen = max(
                     unique_texts,
                     key=lambda t: (text_counts[t]["count"], -len(t)),
@@ -402,63 +420,21 @@ class PlateTextAggregator:
         return groups
 
     def _is_similar(self, text_a, text_b):
-        """
-        Check if two plate texts are similar, accounting for OCR errors.
-        Uses character normalization (1↔7, 0↔O, etc.) before comparing.
-        """
+        """Check if two plate texts are similar, accounting for OCR errors."""
         if abs(len(text_a) - len(text_b)) > 2:
             return False
 
-        # Normalize OCR-confusable characters
-        norm_a = self._normalize(text_a)
-        norm_b = self._normalize(text_b)
+        norm_a = normalize_plate(text_a)
+        norm_b = normalize_plate(text_b)
 
-        # Exact match after normalization
         if norm_a == norm_b:
             return True
 
-        # Substring check (handles extra leading/trailing noise chars)
         if norm_a in norm_b or norm_b in norm_a:
             return True
 
-        # Edit distance on normalized text
-        distance = self._edit_distance(norm_a, norm_b)
+        distance = edit_distance(norm_a, norm_b)
         max_len = max(len(norm_a), len(norm_b))
         if max_len == 0:
             return True
         return distance <= max(2, int(max_len * 0.3))
-
-    def _normalize(self, text):
-        """Normalize OCR-confusable characters to canonical forms."""
-        char_map = {
-            "O": "0",
-            "I": "1",
-            "L": "1",
-            "Z": "2",
-            "S": "5",
-            "B": "8",
-            "G": "6",
-            "7": "1",
-        }
-        return "".join(char_map.get(ch, ch) for ch in text.upper())
-
-    def _edit_distance(self, s1, s2):
-        """Compute Levenshtein edit distance."""
-        m, n = len(s1), len(s2)
-        dp = [[0] * (n + 1) for _ in range(m + 1)]
-
-        for i in range(m + 1):
-            dp[i][0] = i
-        for j in range(n + 1):
-            dp[0][j] = j
-
-        for i in range(1, m + 1):
-            for j in range(1, n + 1):
-                cost = 0 if s1[i - 1] == s2[j - 1] else 1
-                dp[i][j] = min(
-                    dp[i - 1][j] + 1,
-                    dp[i][j - 1] + 1,
-                    dp[i - 1][j - 1] + cost,
-                )
-
-        return dp[m][n]
