@@ -47,3 +47,16 @@ htmlcov/
 
 # mypy
 .mypy_cache/
+
+# Model weights
+*.pt
+*.onnx
+
+# Video files
+*.mp4
+*.avi
+*.mkv
+*.mov
+
+# Output
+output/
