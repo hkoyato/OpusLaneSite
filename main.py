@@ -28,45 +28,157 @@ def _resize_for_display(frame, target_width):
 
 def _deduplicate_by_plate(tracks):
     """
-    Merge tracks that share the same plate text.
+    Merge tracks that have the same or similar plate text.
 
-    If the tracker failed to re-identify a vehicle after occlusion and
-    created a duplicate track, but both tracks got the same plate text via OCR,
-    merge them into a single track spanning the full time range.
+    Uses fuzzy matching that accounts for common OCR errors:
+    - Leading/trailing characters added by noise (E before W)
+    - 1↔7, 0↔O, 8↔B confusion
+    - One or two character differences
+
+    If two tracks have similar plate text, they are merged into one
+    spanning the full time range.
     """
-    # Group tracks by plate text
-    plate_groups = {}
+    plate_tracks = []
     no_plate_tracks = []
 
     for track in tracks:
         if track.plate_text and len(track.plate_text) >= 3:
-            key = track.plate_text
-            if key not in plate_groups:
-                plate_groups[key] = []
-            plate_groups[key].append(track)
+            plate_tracks.append(track)
         else:
             no_plate_tracks.append(track)
 
-    merged_tracks = []
+    if not plate_tracks:
+        return tracks
 
-    for plate_text, group in plate_groups.items():
+    # Build groups of similar plates
+    groups = []
+    used = set()
+
+    # Sort by confidence descending — higher confidence plates are "anchors"
+    plate_tracks.sort(key=lambda t: t.plate_confidence, reverse=True)
+
+    for i, track in enumerate(plate_tracks):
+        if i in used:
+            continue
+        group = [track]
+        used.add(i)
+
+        for j in range(i + 1, len(plate_tracks)):
+            if j in used:
+                continue
+            if _plates_are_similar(track.plate_text, plate_tracks[j].plate_text):
+                group.append(plate_tracks[j])
+                used.add(j)
+
+        groups.append(group)
+
+    # Merge each group into a single track
+    merged_tracks = []
+    for group in groups:
         if len(group) == 1:
             merged_tracks.append(group[0])
         else:
-            # Merge: keep the track with most hits, extend its time range
-            group.sort(key=lambda t: t.hit_count, reverse=True)
+            # Primary = highest confidence reading
+            group.sort(key=lambda t: t.plate_confidence, reverse=True)
             primary = group[0]
             for other in group[1:]:
                 primary.first_frame = min(primary.first_frame, other.first_frame)
                 primary.last_frame = max(primary.last_frame, other.last_frame)
                 primary.hit_count += other.hit_count
-                # Keep best plate confidence
-                if other.plate_confidence > primary.plate_confidence:
-                    primary.plate_text = other.plate_text
-                    primary.plate_confidence = other.plate_confidence
             merged_tracks.append(primary)
 
     return merged_tracks + no_plate_tracks
+
+
+def _plates_are_similar(plate_a, plate_b):
+    """
+    Check if two plate texts are likely the same plate with OCR errors.
+
+    Accounts for:
+    - Common character confusions (1↔7, 0↔O, 5↔S, 8↔B, I↔1)
+    - Extra leading/trailing characters from noise
+    - Standard edit distance
+    """
+    a = plate_a.upper()
+    b = plate_b.upper()
+
+    # Exact match
+    if a == b:
+        return True
+
+    # Normalize OCR-confusable characters and compare
+    norm_a = _normalize_plate(a)
+    norm_b = _normalize_plate(b)
+    if norm_a == norm_b:
+        return True
+
+    # Check if one is a substring of the other (extra chars from noise)
+    if norm_a in norm_b or norm_b in norm_a:
+        return True
+
+    # Check with leading/trailing char stripped (common OCR artifact)
+    if len(a) > len(b):
+        longer, shorter = norm_a, norm_b
+    else:
+        longer, shorter = norm_b, norm_a
+
+    # Try removing 1 char from start or end of longer
+    if len(longer) - len(shorter) <= 2:
+        for start in range(len(longer) - len(shorter) + 1):
+            substr = longer[start:start + len(shorter)]
+            if substr == shorter:
+                return True
+
+    # Edit distance on normalized text
+    dist = _edit_distance(norm_a, norm_b)
+    max_len = max(len(norm_a), len(norm_b))
+    if max_len == 0:
+        return True
+
+    # Allow up to 30% difference or 2 chars, whichever is more generous
+    threshold = max(2, int(max_len * 0.3))
+    return dist <= threshold
+
+
+def _normalize_plate(text):
+    """
+    Normalize plate text by mapping OCR-confusable characters to canonical forms.
+    This makes comparison robust to common OCR mistakes.
+    """
+    # Map visually similar characters to a canonical form
+    char_map = {
+        "O": "0",   # O looks like 0
+        "I": "1",   # I looks like 1
+        "L": "1",   # L can look like 1 in some fonts
+        "Z": "2",   # Z looks like 2
+        "S": "5",   # S looks like 5
+        "B": "8",   # B looks like 8
+        "G": "6",   # G can look like 6
+        "7": "1",   # 7 and 1 are commonly confused
+    }
+    result = ""
+    for ch in text.upper():
+        result += char_map.get(ch, ch)
+    return result
+
+
+def _edit_distance(s1, s2):
+    """Compute Levenshtein edit distance."""
+    m, n = len(s1), len(s2)
+    dp = [[0] * (n + 1) for _ in range(m + 1)]
+    for i in range(m + 1):
+        dp[i][0] = i
+    for j in range(n + 1):
+        dp[0][j] = j
+    for i in range(1, m + 1):
+        for j in range(1, n + 1):
+            cost = 0 if s1[i - 1] == s2[j - 1] else 1
+            dp[i][j] = min(
+                dp[i - 1][j] + 1,
+                dp[i][j - 1] + 1,
+                dp[i - 1][j - 1] + cost,
+            )
+    return dp[m][n]
 
 
 def draw_annotations(frame, tracks):
