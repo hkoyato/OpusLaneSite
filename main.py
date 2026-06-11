@@ -11,6 +11,7 @@ import cv2
 import numpy as np
 
 from detector import VehicleDetector
+from detector_rekognition import RekognitionDetector
 from tracker import VehicleTracker
 from ocr import PlateOCR, PlateTextAggregator
 from appearance import AppearanceExtractor
@@ -165,6 +166,9 @@ def process_video(
     ocr_interval,
     no_ocr,
     display_width,
+    detector_backend,
+    aws_region,
+    detect_interval,
 ):
     """Main processing pipeline. Handles both file and live stream input."""
     import time as _time
@@ -202,14 +206,25 @@ def process_video(
         print(f"Video: {source}")
         print(f"Resolution: {width}x{height}, FPS: {fps:.1f}, Frames: {total_frames}")
     print(f"OCR: {'disabled' if no_ocr else f'enabled (languages={ocr_languages}, interval={ocr_interval} frames)'}")
+    if detect_interval > 1:
+        print(f"Detection interval: every {detect_interval} frames (Kalman prediction between)")
     print()
 
     # Initialize components
-    detector = VehicleDetector(
-        vehicle_model_path="yolov8n.pt",
-        plate_model_path=plate_model_path,
-        confidence=confidence,
-    )
+    if detector_backend == "rekognition":
+        print(f"Using AWS Rekognition detector (region: {aws_region})")
+        detector = RekognitionDetector(
+            region_name=aws_region,
+            confidence=confidence,
+            use_rekognition_text=True,
+        )
+    else:
+        print("Using YOLOv8 local detector")
+        detector = VehicleDetector(
+            vehicle_model_path="yolov8n.pt",
+            plate_model_path=plate_model_path,
+            confidence=confidence,
+        )
 
     tracker = VehicleTracker(
         iou_threshold=0.3,
@@ -222,6 +237,7 @@ def process_video(
 
     appearance_extractor = AppearanceExtractor(feature_dim=128)
 
+    # Always create aggregator when Rekognition is the backend (it reads text for free)
     plate_ocr = None
     text_aggregator = None
     if not no_ocr:
@@ -229,6 +245,9 @@ def process_video(
         plate_ocr = PlateOCR(languages=ocr_languages, gpu=True)
         text_aggregator = PlateTextAggregator(min_readings=3, agreement_threshold=0.4)
         print("OCR ready.")
+    elif detector_backend == "rekognition":
+        text_aggregator = PlateTextAggregator(min_readings=2, agreement_threshold=0.4)
+        print("Using Rekognition text detection (EasyOCR disabled).")
 
     # Initialize video writer (only for file input or if explicitly requested for stream)
     writer = None
@@ -269,19 +288,43 @@ def process_video(
 
         reconnect_attempts = 0  # Reset on successful read
 
-        # Detect vehicles and plates
-        detections = detector.detect(frame)
+        # Detect vehicles and plates (skip frames to reduce API/GPU load)
+        run_detection = (frame_idx % detect_interval == 0)
 
-        # Extract appearance features for all detections
-        features = None
-        if detections:
-            bboxes = [d["bbox"] for d in detections]
-            features = appearance_extractor.extract_batch(frame, bboxes)
+        if run_detection:
+            detections = detector.detect(frame)
 
-        # Update tracker with detections and features
-        active_tracks = tracker.update(detections, frame_idx, features)
+            # Extract appearance features for all detections
+            features = None
+            if detections:
+                bboxes = [d["bbox"] for d in detections]
+                features = appearance_extractor.extract_batch(frame, bboxes)
 
-        # Run OCR on plate regions periodically with multi-frame voting
+            # Update tracker with detections and features
+            active_tracks = tracker.update(detections, frame_idx, features)
+
+            # Feed Rekognition plate text directly into aggregator (avoids EasyOCR)
+            if text_aggregator and detector_backend == "rekognition":
+                for det in detections:
+                    plate_text = det.get("plate_text")
+                    plate_conf = det.get("plate_text_conf", 0.0)
+                    if plate_text and plate_conf > 0.5:
+                        # Find matching track for this detection
+                        for track in active_tracks:
+                            if track.bbox == det["bbox"] or (
+                                track.plate_bbox == det.get("plate_bbox")
+                                and track.plate_bbox is not None
+                            ):
+                                text_aggregator.add_reading(
+                                    track.vehicle_id, plate_text, plate_conf,
+                                    track.visibility,
+                                )
+                                break
+        else:
+            # No detection this frame — tracker predicts using Kalman
+            active_tracks = tracker.update([], frame_idx, None)
+
+        # Run EasyOCR on plate regions periodically (skip if Rekognition already read text)
         if plate_ocr and frame_idx % ocr_interval == 0:
             for track in active_tracks:
                 if track.frames_since_seen == 0 and track.plate_bbox is not None:
@@ -290,6 +333,15 @@ def process_video(
                         text_aggregator.add_reading(
                             track.vehicle_id, text, conf, track.visibility
                         )
+                    consensus_text, consensus_conf = text_aggregator.get_consensus(
+                        track.vehicle_id
+                    )
+                    if consensus_text:
+                        track.update_plate_text(consensus_text, consensus_conf)
+        elif text_aggregator:
+            # Still update consensus even on non-OCR frames (Rekognition may have added readings)
+            for track in active_tracks:
+                if track.frames_since_seen == 0:
                     consensus_text, consensus_conf = text_aggregator.get_consensus(
                         track.vehicle_id
                     )
@@ -392,7 +444,12 @@ def main():
 
     parser.add_argument(
         "--output", default=None,
-        help="Path to save annotated output video (default: output.mp4 for file, none for stream)",
+        help="Path to save annotated output video",
+    )
+    parser.add_argument(
+        "--no-output",
+        action="store_true",
+        help="Disable saving output video",
     )
     parser.add_argument(
         "--conf",
@@ -431,12 +488,33 @@ def main():
         default=1280,
         help="Width of the display window in pixels (maintains aspect ratio)",
     )
+    parser.add_argument(
+        "--detector",
+        choices=["yolo", "rekognition"],
+        default="yolo",
+        help="Detection backend: 'yolo' (local YOLOv8) or 'rekognition' (AWS API)",
+    )
+    parser.add_argument(
+        "--aws-region",
+        default="us-east-1",
+        help="AWS region for Rekognition API (used with --detector rekognition)",
+    )
+    parser.add_argument(
+        "--detect-interval",
+        type=int,
+        default=1,
+        help="Run detection every N frames (Kalman predicts between). "
+        "Higher values reduce API calls for Rekognition or GPU load for YOLO. "
+        "Default: 1 (every frame). Recommended for Rekognition: 5-10.",
+    )
 
     args = parser.parse_args()
 
     # Default output path for file mode
     output = args.output
-    if output is None and args.video:
+    if args.no_output:
+        output = None
+    elif output is None and args.video:
         output = "output.mp4"
 
     # For stream mode, auto-enable show if no output specified
@@ -454,6 +532,9 @@ def main():
         ocr_interval=args.ocr_interval,
         no_ocr=args.no_ocr,
         display_width=args.display_width,
+        detector_backend=args.detector,
+        aws_region=args.aws_region,
+        detect_interval=args.detect_interval,
     )
 
 
