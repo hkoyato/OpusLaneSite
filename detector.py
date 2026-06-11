@@ -97,12 +97,30 @@ class VehicleDetector:
         1. YOLO plate model (if provided) — most accurate
         2. Contour/morphology-based detection — good fallback
 
+        Skips detection if the vehicle bbox looks heavily occluded
+        (aspect ratio suggests only top/side is visible).
+
         Returns
         -------
         tuple or None
             (x1, y1, x2, y2) in frame coordinates, or None if not found.
         """
         x1, y1, x2, y2 = vehicle_bbox
+        vw = x2 - x1
+        vh = y2 - y1
+
+        # Skip if vehicle crop is too small
+        if vw < 50 or vh < 50:
+            return None
+
+        # Skip plate detection for heavily occluded vehicles.
+        # A normal car bbox has aspect ratio (w/h) roughly 1.0-2.5.
+        # If it's extremely wide and short (>3.0), only the top/side is visible
+        # and the plate area (bottom) is likely hidden behind another car.
+        aspect = vw / vh if vh > 0 else 0
+        if aspect > 3.0:
+            return None
+
         vehicle_crop = frame[y1:y2, x1:x2]
 
         if vehicle_crop.size == 0:

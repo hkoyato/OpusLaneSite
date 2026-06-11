@@ -26,6 +26,49 @@ def _resize_for_display(frame, target_width):
     return cv2.resize(frame, (target_width, target_height), interpolation=cv2.INTER_AREA)
 
 
+def _deduplicate_by_plate(tracks):
+    """
+    Merge tracks that share the same plate text.
+
+    If the tracker failed to re-identify a vehicle after occlusion and
+    created a duplicate track, but both tracks got the same plate text via OCR,
+    merge them into a single track spanning the full time range.
+    """
+    # Group tracks by plate text
+    plate_groups = {}
+    no_plate_tracks = []
+
+    for track in tracks:
+        if track.plate_text and len(track.plate_text) >= 3:
+            key = track.plate_text
+            if key not in plate_groups:
+                plate_groups[key] = []
+            plate_groups[key].append(track)
+        else:
+            no_plate_tracks.append(track)
+
+    merged_tracks = []
+
+    for plate_text, group in plate_groups.items():
+        if len(group) == 1:
+            merged_tracks.append(group[0])
+        else:
+            # Merge: keep the track with most hits, extend its time range
+            group.sort(key=lambda t: t.hit_count, reverse=True)
+            primary = group[0]
+            for other in group[1:]:
+                primary.first_frame = min(primary.first_frame, other.first_frame)
+                primary.last_frame = max(primary.last_frame, other.last_frame)
+                primary.hit_count += other.hit_count
+                # Keep best plate confidence
+                if other.plate_confidence > primary.plate_confidence:
+                    primary.plate_text = other.plate_text
+                    primary.plate_confidence = other.plate_confidence
+            merged_tracks.append(primary)
+
+    return merged_tracks + no_plate_tracks
+
+
 def draw_annotations(frame, tracks):
     """Draw bounding boxes, IDs, and plate text on the frame."""
     for track in tracks:
@@ -133,9 +176,11 @@ def process_video(
 
     tracker = VehicleTracker(
         iou_threshold=0.3,
-        max_lost=int(fps * 2),
+        max_lost=int(fps * 4),        # Keep tracks alive 4 seconds during occlusion
         min_hits=3,
-        appearance_weight=0.3,
+        appearance_weight=0.4,
+        reid_threshold=0.45,           # Re-ID sensitivity
+        gallery_max_age=int(fps * 30), # Keep in gallery up to 30 seconds
     )
 
     appearance_extractor = AppearanceExtractor(feature_dim=128)
@@ -236,6 +281,10 @@ def process_video(
                 )
                 if consensus_text:
                     track.update_plate_text(consensus_text, consensus_conf)
+
+        # Deduplicate tracks with the same plate text
+        all_tracks = _deduplicate_by_plate(all_tracks)
+
         print_results(all_tracks, fps)
     else:
         print("No vehicles detected in the video.")

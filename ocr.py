@@ -86,9 +86,13 @@ class PlateOCR:
         if not all_results:
             return "", 0.0
 
-        # Pick the result with highest confidence
+        # Pick the result with highest confidence that passes validation
         all_results.sort(key=lambda x: x[1], reverse=True)
-        return all_results[0]
+        for text, conf in all_results:
+            if self._is_valid_plate_text(text, conf):
+                return text, conf
+
+        return "", 0.0
 
     def _multi_preprocess(self, plate_img):
         """
@@ -155,9 +159,9 @@ class PlateOCR:
                 allowlist=self.allowlist,
                 batch_size=1,
                 min_size=10,
-                text_threshold=0.6,
+                text_threshold=0.5,
                 low_text=0.3,
-                width_ths=0.8,  # Merge close text boxes
+                width_ths=1.0,
             )
         except Exception:
             return "", 0.0
@@ -172,8 +176,11 @@ class PlateOCR:
         confs = []
 
         for bbox, text, conf in results:
+            # Reject very low confidence individual detections
+            if conf < 0.2:
+                continue
             cleaned = self._clean_plate_text(text)
-            if cleaned and len(cleaned) >= 2:  # Ignore single-char noise
+            if cleaned and len(cleaned) >= 1:
                 texts.append(cleaned)
                 confs.append(conf)
 
@@ -183,11 +190,78 @@ class PlateOCR:
         combined = "".join(texts)
         avg_conf = sum(confs) / len(confs)
 
-        # Reject very short results (likely noise)
-        if len(combined) < 3:
+        # Reject very short or very long results
+        if len(combined) < 3 or len(combined) > 12:
             return "", 0.0
 
         return combined, avg_conf
+
+    def _is_valid_plate_text(self, text, confidence):
+        """
+        Validate that OCR result looks like a real license plate.
+
+        Real plates typically:
+        - Are 4-10 characters
+        - Contain both letters and digits (most formats)
+        - Have confidence > 0.4
+        - Don't have too many repeated characters
+        - Don't contain common vehicle words/logos
+        """
+        if not text or confidence < 0.4:
+            return False
+
+        length = len(text)
+        if length < 4 or length > 10:
+            return False
+
+        # Reject common vehicle body text / logos (not plates)
+        text_upper = text.upper()
+        non_plate_words = [
+            "TAXI", "POLICE", "AMBULANCE", "FIRE", "SCHOOL",
+            "BUS", "UBER", "LYFT", "FEDEX", "UPS", "DHL",
+            "FORD", "HONDA", "TOYOTA", "BMW", "AUDI", "BENZ",
+            "CHEVR", "NISSAN", "HYUNDAI", "KIA", "VOLVO",
+            "DIESEL", "HYBRID", "TURBO", "SPORT", "EDITION",
+        ]
+        for word in non_plate_words:
+            if word in text_upper:
+                return False
+
+        # Reject if text starts with a common logo/brand word pattern
+        # Real plates don't usually start with full English words > 3 chars
+        if length >= 5:
+            alpha_prefix = ""
+            for ch in text_upper:
+                if ch.isalpha():
+                    alpha_prefix += ch
+                else:
+                    break
+            if len(alpha_prefix) >= 4 and alpha_prefix in [
+                "TAXI", "UBER", "LYFT", "FORD", "JEEP", "MINI",
+                "FIRE", "CITY", "AUTO", "RENT", "FREE", "CALL",
+            ]:
+                return False
+
+        # Must contain at least one digit
+        has_digit = any(c.isdigit() for c in text)
+        # Must contain at least one letter
+        has_letter = any(c.isalpha() for c in text)
+
+        if not has_digit or not has_letter:
+            return False
+
+        # Reject if too many repeated characters (e.g., "AAAAAAA" from noise)
+        char_counts = Counter(text)
+        most_common_count = char_counts.most_common(1)[0][1]
+        if most_common_count > length * 0.6:
+            return False
+
+        # Reject obvious non-plate patterns
+        unique_chars = len(set(text))
+        if unique_chars < 2:
+            return False
+
+        return True
 
     def _clean_plate_text(self, text):
         """Clean OCR output for plate characters."""
