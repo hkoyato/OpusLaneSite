@@ -1,0 +1,2 @@
+# Keep this directory under version control. Place model weights (e.g.
+# yolov8n.pt) here; the weights themselves are git-ignored.

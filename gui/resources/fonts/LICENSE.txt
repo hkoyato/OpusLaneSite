@@ -1,0 +1,16 @@
+Roboto Font
+===========
+
+The Roboto font files bundled in this directory (Roboto-Regular.ttf,
+Roboto-Medium.ttf, Roboto-Bold.ttf) are Copyright Google Inc. and are
+licensed under the Apache License, Version 2.0.
+
+You may obtain a copy of the License at:
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Source: https://fonts.google.com/specimen/Roboto
+
+These files are redistributed unmodified for use as the application's
+brand typeface, ensuring consistent text rendering on systems where
+Roboto is not installed.
