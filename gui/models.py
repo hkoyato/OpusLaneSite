@@ -114,5 +114,5 @@ class AppSettings:
     station_id: str = "demo_station_01"  # Station_Identifier
     station_display_name: str = "demo_station_01"  # Station_Display_Name
     # Station Stats API publishing (station-stats-api spec)
-    api_base_url: str = ""
-    client_credential: str = ""
+    api_base_url: str = "https://m2tmgtt9n6.execute-api.us-west-2.amazonaws.com/prod"
+    client_credential: str = "lanesight-demo-credential"
