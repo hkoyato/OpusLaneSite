@@ -238,6 +238,16 @@ class SettingsManager:
         elif len(station_display_name) > 128:
             station_display_name = station_display_name[:128]
 
+        # api_base_url: string, default empty (unconfigured).
+        api_base_url = data.get("api_base_url", "")
+        if not isinstance(api_base_url, str):
+            api_base_url = ""
+
+        # client_credential: string, default empty (unconfigured).
+        client_credential = data.get("client_credential", "")
+        if not isinstance(client_credential, str):
+            client_credential = ""
+
         return AppSettings(
             confidence=confidence,
             ocr_enabled=ocr_enabled,
@@ -257,6 +267,8 @@ class SettingsManager:
             active_lanes=active_lanes,
             station_id=station_id,
             station_display_name=station_display_name,
+            api_base_url=api_base_url,
+            client_credential=client_credential,
         )
 
     def _schedule_save(self) -> None:

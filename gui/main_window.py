@@ -36,6 +36,7 @@ from PySide6.QtWidgets import (
 )
 
 from gui.assets import DEFAULT_VEHICLE_MODEL, ensure_model, models_dir, resolve_model
+from gui.api_publisher import ApiPublisher
 from gui.input_panel import InputPanel
 from gui.models import ProcessingConfig
 from gui.processing_view import ProcessingView
@@ -48,6 +49,7 @@ from gui.station_validation import header_label
 from gui.theme import BrandTheme
 from gui.utils import is_valid_video_extension, rekognition_setup_error
 from gui.worker import WorkerThread
+from gui.metrics import compute_station_metrics
 
 # Vehicle detection model. Located via gui.assets.resolve_model, which searches
 # assets/models/ and other known locations regardless of working directory
@@ -218,6 +220,10 @@ class MainWindow(QMainWindow):
         self._update_station_label(
             self.station_controller.active().effective_display_name
         )
+
+        # API publisher: wires the LaneSightClient to publish station metrics
+        # to the Station_Stats_API (for the public dashboard and program ops).
+        self._publisher = ApiPublisher(self._settings)
 
     def _scrollable(self, widget: QWidget) -> QScrollArea:
         """Wrap *widget* in a vertical scroll area that resizes to the viewport.
@@ -595,6 +601,12 @@ class MainWindow(QMainWindow):
         # 11.10); file mode keeps determinate progress.
         self.processing_view.set_stream_mode(is_stream)
         self.switch_view("processing")
+
+        # Start periodic API publishing for live/stream mode so the public
+        # dashboard stays fresh while the stream is running.
+        if is_stream:
+            self._publisher.start_live_publishing()
+
         self._worker.start()
 
     def on_worker_finished(self, results: list) -> None:
@@ -608,6 +620,8 @@ class MainWindow(QMainWindow):
         still returns to the input view via ``_on_thread_finished``.
         """
         self._cancelling = False
+        # Stop live publishing (stream mode) now that processing is done.
+        self._publisher.stop_live_publishing()
         # Surface the active Station_Display_Name in the results header,
         # captured from the StationController at display time (Req 6.4). The
         # controller is the single source of truth for the active identity and
@@ -625,6 +639,24 @@ class MainWindow(QMainWindow):
             self._session_active_lanes,
         )
         self.switch_view("results")
+
+        # Publish final station metrics snapshot to the API.
+        self._publish_metrics(results)
+
+    def _publish_metrics(self, results: list) -> None:
+        """Compute station metrics from results and publish to the API."""
+        observed_duration = (
+            self._total_frames / self._session_fps
+            if self._session_fps > 0 and self._total_frames > 0
+            else None
+        )
+        metrics = compute_station_metrics(
+            results,
+            active_lanes=self._session_active_lanes,
+            observed_duration_seconds=observed_duration,
+        )
+        # Update the publisher's cached metrics (used by live timer too).
+        self._publisher.publish_snapshot(metrics)
 
     def on_worker_error(self, error_msg: str, frame_idx: int) -> None:
         """Handle a pipeline error — show a dialog and return to the input view.
@@ -700,6 +732,29 @@ class MainWindow(QMainWindow):
     ) -> None:
         if total > 0:
             self._total_frames = total
+        # For stream mode (total == -1): keep the publisher's cached metrics
+        # fresh using the live active vehicle count so the 30-second timer has
+        # data to publish to the public dashboard.
+        if total == -1 and active >= 0:
+            from gui.metrics import StationMetrics, estimate_public_wait
+            lanes = self._session_active_lanes or 1
+            # Use a rough estimate: active vehicles ≈ queue depth, and assume
+            # ~6 min avg inspection (the default from the product overview).
+            avg_insp = 6.0
+            wait = round(estimate_public_wait(active, avg_insp, lanes))
+            live_metrics = StationMetrics(
+                station_name="Demo Inspection Station",
+                total_vehicles=current,
+                vehicles_in_queue=active,
+                completed_vehicles=max(0, current - active),
+                active_lanes=lanes,
+                average_inspection_minutes=avg_insp,
+                average_queue_wait_minutes=None,
+                estimated_public_wait_minutes=wait if active > 0 else 0,
+                throughput_per_hour=(current / (elapsed / 3600)) if elapsed > 0 else 0,
+                observed_duration_minutes=elapsed / 60.0,
+            )
+            self._publisher._last_metrics = live_metrics
 
     def _track_frame_error(self, count: int) -> None:
         self._skipped_frames = count

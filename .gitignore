@@ -63,3 +63,7 @@ node_modules/
 
 # Output
 output/
+
+# AWS SAM / deployment build artifacts
+.aws-sam/
+.build/

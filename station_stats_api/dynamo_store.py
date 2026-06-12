@@ -103,6 +103,26 @@ def _normalize(value: Any) -> Any:
     return value
 
 
+def _to_dynamodb(value: Any) -> Any:
+    """Recursively convert Python float/int values to Decimal for DynamoDB.
+
+    The DynamoDB resource API requires numeric values as :class:`decimal.Decimal`.
+    This converts Python floats and ints (except booleans) so that validated
+    snapshot dicts can be stored directly.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, float):
+        return Decimal(str(value))
+    if isinstance(value, int):
+        return Decimal(value)
+    if isinstance(value, dict):
+        return {k: _to_dynamodb(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_dynamodb(v) for v in value]
+    return value
+
+
 class DynamoStatisticsStore:
     """DynamoDB-backed :class:`~station_stats_api.store.StatisticsStore`.
 
@@ -188,7 +208,7 @@ class DynamoStatisticsStore:
             ATTR_STATION_ID: station_id,
             ATTR_TIMESTAMP: submitted_ts,
             ATTR_TIMESTAMP_UTC: new_utc,
-            ATTR_SNAPSHOT: snapshot,
+            ATTR_SNAPSHOT: _to_dynamodb(snapshot),
         }
 
         try:

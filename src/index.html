@@ -1,0 +1,51 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Opus LaneSight public wait times</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Roboto:wght@400;500;700&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="./styles.css" />
+    <script src="./config.js"></script>
+    <script type="module" src="./app.js"></script>
+  </head>
+  <body>
+    <header class="hero">
+      <nav class="brand-bar" aria-label="Product">
+        <img class="opus-logo" src="./assets/OPUS-logo.png" alt="Opus" />
+        <div>
+          <p class="eyebrow">Opus LaneSight</p>
+          <p class="descriptor">Public station wait-time demo</p>
+        </div>
+      </nav>
+      <section class="hero-content" aria-labelledby="page-title">
+        <p class="hero-kicker">Motorist wait-time information</p>
+        <h1 id="page-title">See current station wait times</h1>
+        <p class="hero-copy">Choose an inspection station to view the latest public estimate from Opus LaneSight.</p>
+      </section>
+    </header>
+
+    <main class="page-shell">
+      <section class="selector-card card" aria-labelledby="selector-title">
+        <div class="section-heading">
+          <h2 id="selector-title">Choose a station</h2>
+          <p id="selector-state" class="state-text" role="status">Station list will load automatically.</p>
+        </div>
+        <label class="select-label" for="station-select">Inspection station</label>
+        <select id="station-select" disabled>
+          <option value="">Loading stations...</option>
+        </select>
+      </section>
+
+      <section id="wait-card" class="wait-card card" aria-live="polite" aria-labelledby="wait-card-title">
+        <h2 id="wait-card-title">Station wait time</h2>
+        <div class="empty-state">
+          <p class="state-title">Select a station</p>
+          <p class="state-copy">Wait-time data will appear here when a station is selected.</p>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>

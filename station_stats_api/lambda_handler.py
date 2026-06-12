@@ -74,7 +74,12 @@ PLACEHOLDER_CREDENTIALS: frozenset[str] = frozenset({"lanesight-demo-credential"
 _INTERNAL_ERROR_BODY = {"error": "The request could not be completed."}
 
 #: JSON content type returned on every proxy response.
-_JSON_HEADERS = {"Content-Type": "application/json"}
+_JSON_HEADERS = {
+    "Content-Type": "application/json",
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Headers": "Content-Type,X-Client-Credential",
+    "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+}
 
 
 # --- Lazy default store singleton -----------------------------------------------
@@ -158,6 +163,15 @@ def _method_not_allowed_response() -> dict:
     }
 
 
+def _cors_preflight_response() -> dict:
+    """Return a ``200`` response for OPTIONS preflight requests (CORS)."""
+    return {
+        "statusCode": 200,
+        "headers": dict(_JSON_HEADERS),
+        "body": "",
+    }
+
+
 def _path_parameters(event: dict) -> dict:
     """Return the event's ``pathParameters`` as a dict (never ``None``)."""
     return event.get("pathParameters") or {}
@@ -197,6 +211,8 @@ def snapshot_handler(
     """
     try:
         method = (event.get("httpMethod") or "").upper()
+        if method == "OPTIONS":
+            return _cors_preflight_response()
         if method != "POST":
             return _method_not_allowed_response()
         active_store = store if store is not None else _get_default_store()
@@ -244,6 +260,8 @@ def metrics_handler(
     """
     try:
         method = (event.get("httpMethod") or "").upper()
+        if method == "OPTIONS":
+            return _cors_preflight_response()
         if method != "GET":
             return _method_not_allowed_response()
         active_store = store if store is not None else _get_default_store()

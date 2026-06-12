@@ -66,7 +66,7 @@ SUBMIT_TIMEOUT_SECONDS: float = 10.0
 
 # HTTP header that carries the Client_Credential. API Gateway's credential
 # authorizer reads the API key from this header (design "Endpoints").
-CREDENTIAL_HEADER: str = "x-api-key"
+CREDENTIAL_HEADER: str = "X-Client-Credential"
 
 # Snapshot resource path template (design "Endpoints").
 SNAPSHOT_PATH_TEMPLATE: str = "/stations/{station_id}/snapshot"

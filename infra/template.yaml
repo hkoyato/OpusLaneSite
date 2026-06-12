@@ -1,27 +1,7 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Transform: AWS::Serverless-2016-10-31
 
-Description: >
-  Station Statistics API (Opus LaneSight) - API Gateway + Lambda + DynamoDB.
-  Task 8.1: API Gateway resources, methods, and policies (Infrastructure-as-Code).
-
-  IaC tool decision
-  -----------------
-  No existing IaC convention was found in this repository (no Serverless
-  Framework, SAM, Terraform, or CDK files). AWS SAM / CloudFormation was chosen
-  because it is the most self-contained, demoable artifact for this serverless
-  REST API: a single declarative YAML template provisions the API Gateway REST
-  API, the Lambda handlers, the authorizer, and the DynamoDB Statistics_Store
-  with no extra toolchain beyond the AWS CLI / SAM CLI.
-
-  Intrinsic functions use the longhand form (Ref:, Fn::GetAtt:, Fn::Sub:)
-  rather than the !Ref / !GetAtt short tags so the template parses cleanly with
-  a plain YAML loader (yaml.safe_load) while remaining valid CloudFormation/SAM.
-
-  Lambda Handler values point at station_stats_api.lambda_handler.* - the event
-  adapter that translates API Gateway proxy events into handle_snapshot /
-  get_station / list_stations calls is implemented in task 8.2. These are
-  integration placeholders for this IaC task.
+Description: "Station Statistics API (Opus LaneSight) - API Gateway + Lambda + DynamoDB."
 
 # ---------------------------------------------------------------------------
 # Parameters
@@ -136,10 +116,15 @@ Resources:
         Ref: StageName
       EndpointConfiguration:
         Type: REGIONAL
+      Cors:
+        AllowMethods: "'GET,POST,OPTIONS'"
+        AllowHeaders: "'Content-Type,X-Client-Credential'"
+        AllowOrigin: "'*'"
       # Reject any body larger than 16KB at the gateway (16 * 1024 bytes).
       MinimumCompressionSize: 0
       Auth:
         DefaultAuthorizer: CredentialAuthorizer
+        AddDefaultAuthorizerToCorsPreflight: false
         Authorizers:
           CredentialAuthorizer:
             FunctionArn:
