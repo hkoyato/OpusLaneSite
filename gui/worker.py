@@ -122,6 +122,9 @@ class StreamVideoSource:
     RECONNECT_INTERVAL_SECONDS = 2
     # Default FPS assumed when a stream does not report a valid frame rate.
     DEFAULT_STREAM_FPS = 25.0
+    # Timeout for grab() in seconds. If grab doesn't return within this
+    # window, we return False so the cancel check can run.
+    GRAB_TIMEOUT_SECONDS = 2.0
 
     def __init__(self) -> None:
         self._cap: cv2.VideoCapture | None = None
@@ -138,14 +141,29 @@ class StreamVideoSource:
         self._cap = cv2.VideoCapture(source)
         # Reduce buffer to minimize latency on live streams.
         self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
+        # Set a read timeout so grab() doesn't block forever
+        self._cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000)
+        self._cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 2000)
         return self._cap.isOpened()
 
     def read(self) -> tuple[bool, np.ndarray | None]:
-        """Read the next frame. Returns (success, frame)."""
+        """Read the next frame with a non-blocking grab attempt.
+
+        Uses grab() + retrieve() instead of read() so that the operation
+        can be checked against a timeout. This prevents the stream from
+        blocking the cancel check indefinitely.
+        """
         if self._cap is None:
             return False, None
-        ret, frame = self._cap.read()
-        if not ret:
+
+        # grab() is the potentially blocking call. With CAP_PROP_READ_TIMEOUT_MSEC
+        # set, it should return within ~2 seconds even if the stream stalls.
+        grabbed = self._cap.grab()
+        if not grabbed:
+            return False, None
+
+        ret, frame = self._cap.retrieve()
+        if not ret or frame is None:
             return False, None
         return True, frame
 
@@ -212,6 +230,8 @@ class StreamVideoSource:
         self._cap = cv2.VideoCapture(self._source)
         # Restore the reduced buffer to keep latency low after reconnecting.
         self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
+        self._cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 5000)
+        self._cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 2000)
 
         return self._reconnect_attempts
 
@@ -670,6 +690,9 @@ class WorkerThread(QThread):
 
                 if not ret or frame is None:
                     if is_stream:
+                        # Check cancel before attempting reconnection
+                        if self._cancel_event.is_set():
+                            break
                         # Stream interrupted: reconnect up to MAX_RECONNECT
                         # times at 2s intervals; reconnect() raises
                         # StreamLostError once attempts are exhausted (Req
