@@ -161,3 +161,121 @@ def test_summary_all_dashes_when_no_complete_tracks(view):
     assert labels["avg_wait"].text() == _DASH
     assert labels["max_wait"].text() == _DASH
     assert labels["min_wait"].text() == _DASH
+
+
+# ============================================================================
+# ResultsView extensions: deduplicated display, summary-from-rows, No_Output_Mode
+#
+# Validates: Requirements 14.1, 14.4, 14.5, 15.5
+#
+# The view renders the rows it receives as-is: when Plate_Text_Reading is
+# enabled the worker has already applied Plate_Deduplication (one row per
+# physical plate) and the Plate Text / Confidence columns are shown; when
+# disabled every track is a separate row and those columns are hidden. Summary
+# statistics are computed from the displayed row set. When output_path is None
+# (No_Output_Mode) the path display and open-folder control are hidden and a
+# "No output video written" message is shown instead.
+# ============================================================================
+
+
+def _vehicle_id_column_values(view) -> list[int]:
+    """Return the Vehicle ID column values across all displayed rows."""
+    from gui.results_view import _COL_VEHICLE_ID
+
+    return [
+        int(view._table.item(row, _COL_VEHICLE_ID).text())
+        for row in range(view._table.rowCount())
+    ]
+
+
+# --------------------------------------- deduplicated vs separate rows (14.1/14.4)
+def test_deduplicated_rows_shown_with_plate_columns_when_ocr_enabled(view):
+    """With OCR on, the view displays the (deduplicated) rows it is given and
+    shows the plate columns. (Req 14.1)"""
+    # Two physical plates: the worker already merged duplicates into 2 rows.
+    deduped = [
+        make_result(1, 0.0, 5.0, plate_text="ABC123", plate_confidence=0.91),
+        make_result(2, 1.0, 7.0, plate_text="XYZ789", plate_confidence=0.88),
+    ]
+    view.display_results(deduped, fps=1.0, ocr_enabled=True, output_path="out.mp4",
+                         skipped_frames=0, total_frames=20)
+
+    assert view._table.rowCount() == 2
+    assert _vehicle_id_column_values(view) == [1, 2]
+    assert view._table.isColumnHidden(_COL_PLATE_TEXT) is False
+    assert view._table.isColumnHidden(_COL_CONFIDENCE) is False
+
+
+def test_separate_rows_with_hidden_plate_columns_when_ocr_disabled(view):
+    """With OCR off, every track is its own row and the plate columns are
+    hidden (no plate text to merge on). (Req 14.4)"""
+    # Four separate tracks, none merged because deduplication does not apply.
+    tracks = [
+        make_result(1, 0.0, 5.0),
+        make_result(2, 1.0, 6.0),
+        make_result(3, 2.0, 7.0),
+        make_result(4, 3.0, 8.0),
+    ]
+    view.display_results(tracks, fps=1.0, ocr_enabled=False, output_path="out.mp4",
+                         skipped_frames=0, total_frames=20)
+
+    assert view._table.rowCount() == 4
+    assert _vehicle_id_column_values(view) == [1, 2, 3, 4]
+    assert view._table.isColumnHidden(_COL_PLATE_TEXT) is True
+    assert view._table.isColumnHidden(_COL_CONFIDENCE) is True
+
+
+# ----------------------------------------- summary from displayed rows (14.5)
+def test_summary_computed_from_displayed_deduplicated_rows(view):
+    """Total and wait statistics reflect exactly the rows displayed, i.e. the
+    deduplicated set the view receives. (Req 14.5)"""
+    # Suppose 5 raw tracks merged down to 3 deduplicated rows before display.
+    deduped = [
+        make_result(1, 0.0, 6.0, plate_text="ABC123", plate_confidence=0.9),   # wait 6.0
+        make_result(2, 0.0, 12.0, plate_text="XYZ789", plate_confidence=0.8),  # wait 12.0
+        make_result(3, 0.0, 3.0, plate_text="JKL456", plate_confidence=0.7),   # wait 3.0
+    ]
+    view.display_results(deduped, fps=1.0, ocr_enabled=True, output_path="out.mp4",
+                         skipped_frames=0, total_frames=30)
+
+    labels = view._summary_value_labels
+    # Total counts the 3 displayed rows, not any pre-merge track count.
+    assert labels["total_vehicles"].text() == "3"
+    # Waits 6.0, 12.0, 3.0 -> avg 7.0, max 12.0, min 3.0.
+    assert labels["avg_wait"].text() == "7.0"
+    assert labels["max_wait"].text() == "12.0"
+    assert labels["min_wait"].text() == "3.0"
+
+
+# --------------------------------------------------- No_Output_Mode state (15.5)
+def test_no_output_mode_hides_path_and_folder_and_shows_message(view):
+    """When output_path is None, the path label, prefix, and open-folder button
+    are hidden and the "No output video written" message is shown. (Req 15.5)"""
+    results = [make_result(1, 0.0, 5.0)]
+    view.display_results(results, fps=1.0, ocr_enabled=False, output_path=None,
+                         skipped_frames=0, total_frames=10)
+
+    # isHidden() reflects the explicit setVisible() flag regardless of whether
+    # the (never-shown) top-level widget is realized on screen.
+    assert view._output_prefix_label.isHidden() is True
+    assert view._output_path_label.isHidden() is True
+    assert view._open_folder_btn.isHidden() is True
+    assert view._open_folder_btn.isEnabled() is False
+    assert view._no_output_label.isHidden() is False
+    assert view._no_output_label.text() == "No output video written"
+
+
+def test_output_path_shown_when_output_written(view):
+    """When an output path is provided, the path display and open-folder control
+    are shown and the No_Output_Mode message is hidden. (Req 15.5)"""
+    results = [make_result(1, 0.0, 5.0)]
+    view.display_results(results, fps=1.0, ocr_enabled=False,
+                         output_path="C:/out/annotated.mp4",
+                         skipped_frames=0, total_frames=10)
+
+    assert view._output_prefix_label.isHidden() is False
+    assert view._output_path_label.isHidden() is False
+    assert view._output_path_label.text() == "C:/out/annotated.mp4"
+    assert view._open_folder_btn.isHidden() is False
+    assert view._open_folder_btn.isEnabled() is True
+    assert view._no_output_label.isHidden() is True

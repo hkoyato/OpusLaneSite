@@ -16,17 +16,24 @@ from PySide6.QtCore import QThread, Signal
 from PySide6.QtGui import QImage
 
 from gui.models import ProcessingConfig, VideoMetadata
-from gui.utils import build_track_result
+from gui.utils import build_track_result, deduplicate_by_plate
+
+
+class StreamLostError(Exception):
+    """Raised when a live stream cannot be re-established after the maximum
+    number of reconnection attempts (Req 11.9)."""
 
 
 class VideoSource(Protocol):
-    """Abstract video input — file today, RTSP/RTMP in future."""
+    """Abstract video input — local file or live RTSP/RTMP/HTTP stream."""
 
     def open(self, source: str) -> bool: ...
 
     def read(self) -> tuple[bool, np.ndarray | None]: ...
 
     def get_metadata(self) -> VideoMetadata: ...
+
+    def is_stream(self) -> bool: ...
 
     def release(self) -> None: ...
 
@@ -80,6 +87,134 @@ class FileVideoSource:
             duration_seconds=duration_seconds,
         )
 
+    def is_stream(self) -> bool:
+        """Return False — a local file has a known, finite frame count."""
+        return False
+
+    def release(self) -> None:
+        """Release the underlying VideoCapture resource."""
+        if self._cap is not None:
+            self._cap.release()
+            self._cap = None
+
+
+class StreamVideoSource:
+    """cv2.VideoCapture wrapper for RTSP/RTMP/HTTP live streams (Req 11).
+
+    Mirrors the backend stream handling in ``main.py`` without importing it:
+
+    - ``cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)`` on open to minimize latency.
+    - Defaults FPS to 25.0 when the stream does not report one.
+    - ``get_metadata()`` reports ``frame_count = -1`` (unknown) so the
+      ``WorkerThread`` drives an indeterminate progress indicator.
+    - :meth:`reconnect` releases and re-opens the capture on read failure,
+      retrying up to :attr:`MAX_RECONNECT` times at
+      :attr:`RECONNECT_INTERVAL_SECONDS` intervals, raising
+      :class:`StreamLostError` once attempts are exhausted (Req 11.9).
+
+    ``is_stream()`` returns True so the ``WorkerThread`` selects the
+    indeterminate-progress and reconnection behavior.
+    """
+
+    # Maximum reconnection attempts before the stream is declared lost.
+    MAX_RECONNECT = 5
+    # Seconds to wait between reconnection attempts.
+    RECONNECT_INTERVAL_SECONDS = 2
+    # Default FPS assumed when a stream does not report a valid frame rate.
+    DEFAULT_STREAM_FPS = 25.0
+
+    def __init__(self) -> None:
+        self._cap: cv2.VideoCapture | None = None
+        self._source: str = ""
+        self._reconnect_attempts = 0
+
+    def open(self, source: str) -> bool:
+        """Open the live stream. Returns True if successfully opened.
+
+        Reduces the capture buffer to two frames to minimize latency, exactly
+        as the backend does for stream input.
+        """
+        self._source = source
+        self._cap = cv2.VideoCapture(source)
+        # Reduce buffer to minimize latency on live streams.
+        self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
+        return self._cap.isOpened()
+
+    def read(self) -> tuple[bool, np.ndarray | None]:
+        """Read the next frame. Returns (success, frame)."""
+        if self._cap is None:
+            return False, None
+        ret, frame = self._cap.read()
+        if not ret:
+            return False, None
+        return True, frame
+
+    def get_metadata(self) -> VideoMetadata:
+        """Return VideoMetadata for the stream.
+
+        ``frame_count`` is ``-1`` (unknown) and ``duration_seconds`` is ``0.0``
+        because a live stream has no finite length. FPS defaults to
+        :attr:`DEFAULT_STREAM_FPS` when the stream reports none.
+        """
+        if self._cap is None:
+            return VideoMetadata(
+                file_name="",
+                file_path=self._source,
+                width=0,
+                height=0,
+                frame_count=-1,
+                fps=self.DEFAULT_STREAM_FPS,
+                duration_seconds=0.0,
+            )
+        width = int(self._cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(self._cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps = self._cap.get(cv2.CAP_PROP_FPS)
+        if fps is None or fps <= 0:
+            fps = self.DEFAULT_STREAM_FPS  # Stream did not report a valid FPS.
+        return VideoMetadata(
+            file_name=self._source,
+            file_path=self._source,
+            width=width,
+            height=height,
+            frame_count=-1,
+            fps=fps,
+            duration_seconds=0.0,
+        )
+
+    def is_stream(self) -> bool:
+        """Return True — a live stream has an unknown, unbounded frame count."""
+        return True
+
+    def reset_reconnect_attempts(self) -> None:
+        """Reset the reconnection counter after a successful read."""
+        self._reconnect_attempts = 0
+
+    def reconnect(self) -> int:
+        """Attempt one reconnection after a read failure.
+
+        Increments the attempt counter, then releases and re-opens the
+        capture (restoring the reduced buffer size). Returns the current
+        attempt number (1..:attr:`MAX_RECONNECT`). Raises
+        :class:`StreamLostError` once more than :attr:`MAX_RECONNECT`
+        consecutive failures have occurred (Req 11.9).
+        """
+        self._reconnect_attempts += 1
+        if self._reconnect_attempts > self.MAX_RECONNECT:
+            raise StreamLostError(
+                f"Stream lost after {self.MAX_RECONNECT} reconnection "
+                f"attempts: {self._source}"
+            )
+
+        time.sleep(self.RECONNECT_INTERVAL_SECONDS)
+
+        if self._cap is not None:
+            self._cap.release()
+        self._cap = cv2.VideoCapture(self._source)
+        # Restore the reduced buffer to keep latency low after reconnecting.
+        self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
+
+        return self._reconnect_attempts
+
     def release(self) -> None:
         """Release the underlying VideoCapture resource."""
         if self._cap is not None:
@@ -103,22 +238,43 @@ class PipelineAdapter:
 
     def __init__(self, config: ProcessingConfig, fps: float = 15.0) -> None:
         # Lazy imports keep heavy pipeline dependencies (ultralytics/torch,
-        # easyocr) out of GUI module import time and out of headless tests.
-        from detector import VehicleDetector
+        # easyocr, boto3) out of GUI module import time and out of headless
+        # tests.
         from tracker import VehicleTracker
         from appearance import AppearanceExtractor
 
-        from gui.assets import resolve_model_str
+        from gui.assets import ensure_model, resolve_model_str
 
         self.config = config
         self.fps = fps if fps and fps > 0 else 15.0
         self.ocr_interval = config.ocr_interval
+        # Detection interval (Req 13): detect only on frames where
+        # ``frame_idx % detect_interval == 0``; the tracker's Kalman filter
+        # predicts on the skipped frames.
+        self.detect_interval = config.detect_interval
 
-        self.detector = VehicleDetector(
-            vehicle_model_path=resolve_model_str(),
-            plate_model_path=config.plate_model_path,
-            confidence=config.confidence,
-        )
+        # Select the detector backend (Req 12). Rekognition is a cloud
+        # alternative to local YOLOv8; it can also read plate text itself,
+        # gated on whether plate reading is enabled (config.ocr_enabled).
+        if config.detector_backend == "rekognition":
+            from detector_rekognition import RekognitionDetector
+
+            self.detector = RekognitionDetector(
+                region_name=config.aws_region,
+                confidence=config.confidence,
+                use_rekognition_text=config.ocr_enabled,
+            )
+        else:
+            from detector import VehicleDetector
+
+            # Ensure the model is present (auto-download if missing), falling
+            # back to the bare name so Ultralytics can self-resolve.
+            ensure_model()
+            self.detector = VehicleDetector(
+                vehicle_model_path=resolve_model_str(),
+                plate_model_path=config.plate_model_path,
+                confidence=config.confidence,
+            )
 
         self.tracker = VehicleTracker(
             iou_threshold=0.3,
@@ -131,15 +287,27 @@ class PipelineAdapter:
 
         self.appearance_extractor = AppearanceExtractor(feature_dim=128)
 
+        # Plate-reading setup (only when plate reading is enabled).
+        #   - YOLO backend: EasyOCR reads plates, with a voting aggregator.
+        #   - Rekognition backend: Rekognition reads plate text itself, so no
+        #     EasyOCR is created; an aggregator votes on the Rekognition text
+        #     (mirrors main.py, which uses min_readings=2 for this path).
         self.plate_ocr = None
         self.text_aggregator = None
         if config.ocr_enabled:
-            from ocr import PlateOCR, PlateTextAggregator
+            from ocr import PlateTextAggregator
 
-            self.plate_ocr = PlateOCR(languages=config.ocr_languages, gpu=True)
-            self.text_aggregator = PlateTextAggregator(
-                min_readings=3, agreement_threshold=0.4
-            )
+            if config.detector_backend == "rekognition":
+                self.text_aggregator = PlateTextAggregator(
+                    min_readings=2, agreement_threshold=0.4
+                )
+            else:
+                from ocr import PlateOCR
+
+                self.plate_ocr = PlateOCR(languages=config.ocr_languages, gpu=True)
+                self.text_aggregator = PlateTextAggregator(
+                    min_readings=3, agreement_threshold=0.4
+                )
 
     def process_frame(
         self, frame: np.ndarray, frame_idx: int
@@ -148,6 +316,9 @@ class PipelineAdapter:
 
         Mirrors the per-frame flow of ``process_video`` in ``main.py``:
         detect -> appearance features -> track -> periodic OCR -> annotate.
+        Detection runs only on frames where
+        ``frame_idx % detect_interval == 0``; on skipped frames the tracker is
+        updated with no detections so its Kalman filter predicts forward.
 
         Returns
         -------
@@ -156,17 +327,40 @@ class PipelineAdapter:
             ``active_count`` counts tracks currently visible
             (``frames_since_seen == 0``).
         """
-        # Detect vehicles and plates
-        detections = self.detector.detect(frame)
+        # Detect on interval frames only; predict via Kalman on skipped frames.
+        if frame_idx % self.detect_interval == 0:
+            detections = self.detector.detect(frame)
 
-        # Extract appearance features for all detections
-        features = None
-        if detections:
-            bboxes = [d["bbox"] for d in detections]
-            features = self.appearance_extractor.extract_batch(frame, bboxes)
+            # Extract appearance features for all detections
+            features = None
+            if detections:
+                bboxes = [d["bbox"] for d in detections]
+                features = self.appearance_extractor.extract_batch(frame, bboxes)
 
-        # Update tracker with detections and features
-        active_tracks = self.tracker.update(detections, frame_idx, features)
+            # Update tracker with detections and features
+            active_tracks = self.tracker.update(detections, frame_idx, features)
+
+            # Feed Rekognition plate text directly into the aggregator
+            # (mirrors main.py; avoids a separate EasyOCR pass).
+            if self.text_aggregator and self.config.detector_backend == "rekognition":
+                for det in detections:
+                    plate_text = det.get("plate_text")
+                    plate_conf = det.get("plate_text_conf", 0.0)
+                    if plate_text and plate_conf > 0.5:
+                        # Find the matching track for this detection.
+                        for track in active_tracks:
+                            if track.bbox == det["bbox"] or (
+                                track.plate_bbox == det.get("plate_bbox")
+                                and track.plate_bbox is not None
+                            ):
+                                self.text_aggregator.add_reading(
+                                    track.vehicle_id, plate_text, plate_conf,
+                                    track.visibility,
+                                )
+                                break
+        else:
+            # No detection this frame — tracker predicts using Kalman.
+            active_tracks = self.tracker.update([], frame_idx, None)
 
         # Run OCR on plate regions periodically with multi-frame voting
         if self.plate_ocr and frame_idx % self.ocr_interval == 0:
@@ -183,6 +377,16 @@ class PipelineAdapter:
                     )
                     if consensus_text:
                         track.update_plate_text(consensus_text, consensus_conf)
+        elif self.text_aggregator:
+            # Still update consensus on non-OCR frames (Rekognition may have
+            # added readings on this or a previous detection frame).
+            for track in active_tracks:
+                if track.frames_since_seen == 0:
+                    consensus_text, consensus_conf = self.text_aggregator.get_consensus(
+                        track.vehicle_id
+                    )
+                    if consensus_text:
+                        track.update_plate_text(consensus_text, consensus_conf)
 
         # Draw annotations on a copy to preserve the original frame
         annotated_frame = self._draw_annotations(frame.copy(), active_tracks)
@@ -193,6 +397,18 @@ class PipelineAdapter:
         )
 
         return annotated_frame, active_tracks, active_count
+
+    def finalize(self, tracks: list) -> list:
+        """Apply plate-based deduplication to the final track list.
+
+        Delegates to :func:`gui.utils.deduplicate_by_plate`, which mirrors
+        ``main._deduplicate_by_plate`` via the unmodified ``plate_utils``
+        helpers. Deduplication is applied only when plate reading is enabled
+        (``config.ocr_enabled``); otherwise *tracks* is returned unchanged.
+
+        Validates: Requirements 14.1, 14.2, 14.3, 14.4
+        """
+        return deduplicate_by_plate(tracks, self.config.ocr_enabled)
 
     @staticmethod
     def _draw_annotations(frame: np.ndarray, tracks: list) -> np.ndarray:
@@ -281,7 +497,9 @@ class WorkerThread(QThread):
 
     # Signals
     frame_ready = Signal(QImage, int, int)          # annotated frame, frame_idx, active_tracks
-    progress = Signal(int, int, float, int, float)  # current, total, elapsed, active, eta
+    progress = Signal(int, int, float, int, float)  # current, total(-1 if stream), elapsed, active, eta
+    connecting = Signal(str)                          # stream_url, before the first frame (Req 11.13)
+    reconnect_status = Signal(int, int)               # attempt, max_attempts (Req 11.8)
     frame_error = Signal(int)                        # cumulative error count
     processing_finished = Signal(list)               # list[TrackResult]
     error = Signal(str, int)                         # error message, frame_idx
@@ -333,13 +551,43 @@ class WorkerThread(QThread):
         )
         return image.copy()
 
+    def _emit_results(
+        self, adapter: PipelineAdapter, fps: float, total_frames: int
+    ) -> None:
+        """Build final results from collected tracks and emit completion.
+
+        Applies plate-based deduplication via :meth:`PipelineAdapter.finalize`
+        (a no-op when plate reading is disabled, Req 14) before converting each
+        track to a :class:`TrackResult` and emitting ``processing_finished``.
+        Used for normal end-of-file completion, a stream "Stop" (Req 11.10),
+        and stream loss after exhausted reconnection (Req 11.9) — in every case
+        the results reflect the tracks collected up to that point.
+        """
+        all_tracks = adapter.tracker.get_all_tracks()
+        finalized = adapter.finalize(all_tracks)
+        results = [
+            build_track_result(track, fps, total_frames)
+            for track in finalized
+        ]
+        self.processing_finished.emit(results)
+
     def run(self) -> None:
         """Main processing loop — detect, track, OCR, emit signals per frame.
 
-        Redirects stdout/stderr to the log panel, opens the video source,
-        processes frames through :class:`PipelineAdapter`, writes annotated
-        frames to the output video, and emits per-frame and completion signals.
-        Handles cancellation, frame-read failures, and pipeline exceptions.
+        Redirects stdout/stderr to the log panel, opens the selected video
+        source (file or live stream), processes frames through
+        :class:`PipelineAdapter`, optionally writes annotated frames to the
+        output video, and emits per-frame and completion signals. Handles
+        cancellation, frame-read failures, stream reconnection, and pipeline
+        exceptions.
+
+        File mode keeps determinate progress (current/total frames). Stream
+        mode emits ``connecting`` before the first frame (Req 11.13), reports
+        indeterminate progress (``total = -1``, Req 11.6), reconnects on read
+        failure emitting ``reconnect_status`` (Req 11.8), and on
+        :class:`StreamLostError` finishes with the tracks collected so far
+        (Req 11.9). A ``cv2.VideoWriter`` is created only when an output path
+        is set and No_Output_Mode is off (Req 15.4, 11.11).
         """
         original_stdout = sys.stdout
         original_stderr = sys.stderr
@@ -347,24 +595,40 @@ class WorkerThread(QThread):
         sys.stdout = queue_io
         sys.stderr = queue_io
 
-        source = FileVideoSource()
+        is_stream = self.config.source_mode == "stream"
+        source: VideoSource = (
+            StreamVideoSource() if is_stream else FileVideoSource()
+        )
+        source_path = (
+            self.config.stream_url if is_stream else self.config.video_path
+        )
         writer: cv2.VideoWriter | None = None
+        adapter: PipelineAdapter | None = None
+        fps = 15.0
+        total_frames = -1 if is_stream else 0
         frame_idx = 0
 
         try:
-            if not source.open(self.config.video_path):
-                self.error.emit(
-                    f"Cannot open video file: {self.config.video_path}", 0
-                )
+            # Stream: announce the connecting state before the first frame.
+            if is_stream:
+                self.connecting.emit(source_path)
+
+            if not source.open(source_path):
+                label = "stream" if is_stream else "video file"
+                self.error.emit(f"Cannot open {label}: {source_path}", 0)
                 return
 
             metadata: VideoMetadata = source.get_metadata()
             fps = metadata.fps if metadata.fps and metadata.fps > 0 else 15.0
+            # Streams report frame_count == -1 (unknown) -> indeterminate.
             total_frames = metadata.frame_count
 
             adapter = PipelineAdapter(self.config, fps=fps)
 
-            if self.config.output_path:
+            # Skip VideoWriter creation entirely in No_Output_Mode (Req 15.4)
+            # or when no output path is set (e.g. a stream without recording,
+            # Req 11.11).
+            if not self.config.no_output and self.config.output_path:
                 fourcc = cv2.VideoWriter_fourcc(*"mp4v")
                 writer = cv2.VideoWriter(
                     self.config.output_path,
@@ -380,7 +644,19 @@ class WorkerThread(QThread):
                 ret, frame = source.read()
 
                 if not ret or frame is None:
-                    # Distinguish normal end-of-stream from mid-stream failure.
+                    if is_stream:
+                        # Stream interrupted: reconnect up to MAX_RECONNECT
+                        # times at 2s intervals; reconnect() raises
+                        # StreamLostError once attempts are exhausted (Req
+                        # 11.8/11.9).
+                        attempt = source.reconnect()
+                        self.reconnect_status.emit(
+                            attempt, StreamVideoSource.MAX_RECONNECT
+                        )
+                        continue
+
+                    # File: distinguish normal end-of-file from a mid-stream
+                    # read failure.
                     if total_frames <= 0 or frame_idx >= total_frames:
                         break  # Normal completion.
 
@@ -400,6 +676,9 @@ class WorkerThread(QThread):
                     continue
 
                 consecutive_failures = 0
+                if is_stream:
+                    # Successful read resets the reconnection counter.
+                    source.reset_reconnect_attempts()
 
                 annotated_frame, _active_tracks, active_count = adapter.process_frame(
                     frame, frame_idx
@@ -414,28 +693,43 @@ class WorkerThread(QThread):
 
                 processed = frame_idx + 1
                 elapsed = time.monotonic() - start_time
-                if processed > 0 and total_frames > 0:
-                    remaining = max(0, total_frames - processed)
-                    eta = (elapsed / processed) * remaining
+                if is_stream:
+                    # Indeterminate progress: unknown total, no ETA. The
+                    # ProcessingView shows elapsed/active/fps instead (Req
+                    # 11.6/11.7).
+                    self.progress.emit(processed, -1, elapsed, active_count, 0.0)
                 else:
-                    eta = 0.0
-                self.progress.emit(
-                    processed, total_frames, elapsed, active_count, eta
-                )
+                    if processed > 0 and total_frames > 0:
+                        remaining = max(0, total_frames - processed)
+                        eta = (elapsed / processed) * remaining
+                    else:
+                        eta = 0.0
+                    self.progress.emit(
+                        processed, total_frames, elapsed, active_count, eta
+                    )
 
                 frame_idx += 1
 
+            # Loop exited via cancellation or normal end-of-file.
             if self._cancel_event.is_set():
+                if is_stream:
+                    # Stream "Stop": switch to results with tracks collected so
+                    # far (Req 11.10).
+                    self._emit_results(adapter, fps, total_frames)
+                # File "Cancel": discard incomplete output; the GUI returns to
+                # the input panel (Req 3.6) — no completion signal.
                 return
 
-            # Build final results from all confirmed tracks.
-            all_tracks = adapter.tracker.get_all_tracks()
-            results = [
-                build_track_result(track, fps, total_frames)
-                for track in all_tracks
-            ]
-            self.processing_finished.emit(results)
+            # Normal end-of-file completion.
+            self._emit_results(adapter, fps, total_frames)
 
+        except StreamLostError as exc:
+            # Stream could not be re-established after MAX_RECONNECT attempts:
+            # finish with the tracks collected before the interruption (Req
+            # 11.9).
+            self._record_log(str(exc))
+            if adapter is not None:
+                self._emit_results(adapter, fps, total_frames)
         except Exception as exc:  # noqa: BLE001 - report any pipeline failure
             self.error.emit(f"{type(exc).__name__}: {exc}", frame_idx)
         finally:

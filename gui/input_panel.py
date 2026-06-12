@@ -32,7 +32,12 @@ from PySide6.QtWidgets import (
 
 from gui.models import ProcessingConfig, VideoMetadata
 from gui.settings import SettingsManager
-from gui.utils import clamp_confidence, derive_default_output_path
+from gui.utils import (
+    clamp_confidence,
+    derive_default_output_path,
+    is_valid_aws_region,
+    is_valid_stream_url,
+)
 
 # BrandTheme is optional — the panel degrades gracefully without it.
 try:  # pragma: no cover - import guard
@@ -59,6 +64,35 @@ _VIDEO_FILTER = "Video files (*.mp4 *.avi *.mov *.mkv);;All files (*)"
 
 # OCR language options offered in the dropdown.
 _OCR_LANGUAGES = ["en", "es", "fr", "de", "it", "pt"]
+
+# Input source mode options (Req 11.1). Display text -> internal value.
+_SOURCE_MODE_FILE = "Video file"
+_SOURCE_MODE_STREAM = "Live stream"
+
+# Detector backend options (Req 12.1). Display text -> internal value.
+_BACKEND_YOLO = "Local YOLOv8"
+_BACKEND_REKOGNITION = "AWS Rekognition"
+
+# Field length limits mirrored from the validators in gui.utils.
+_MAX_STREAM_URL_LENGTH = 2048
+_MAX_AWS_REGION_LENGTH = 64
+
+# Detection interval bounds (Req 13.1).
+_DETECT_INTERVAL_MIN = 1
+_DETECT_INTERVAL_MAX = 60
+
+# Privacy note shown for Rekognition + plate reading (Req 12.9 / Req 1.5).
+_PRIVACY_NOTE = (
+    "Plate text reading is opt-in and used for development and testing only. "
+    "LaneSight uses temporary anonymous vehicle session IDs and does not read "
+    "or store license plates or driver identities."
+)
+
+# Recommendation shown for the Rekognition backend (Req 13.3).
+_REKOGNITION_INTERVAL_HINT = (
+    "Recommended detection interval for AWS Rekognition is 5\u201310 to reduce "
+    "API calls and cost."
+)
 
 
 def _safe_row_height(label: QLabel) -> int:
@@ -149,6 +183,20 @@ class InputPanel(QWidget):
         title.setProperty("role", "section-title")
         root.addWidget(title)
 
+        # --- Input source mode selector (Req 11.1) ----------------------
+        source_row = QHBoxLayout()
+        source_row.setSpacing(12)
+        source_label = QLabel("Input source")
+        source_label.setMinimumWidth(180)
+        source_row.addWidget(source_label)
+        self.source_mode_combo = QComboBox()
+        self.source_mode_combo.addItems([_SOURCE_MODE_FILE, _SOURCE_MODE_STREAM])
+        self.source_mode_combo.setCurrentText(_SOURCE_MODE_FILE)
+        self.source_mode_combo.currentTextChanged.connect(self.on_source_mode_changed)
+        source_row.addWidget(self.source_mode_combo)
+        source_row.addStretch(1)
+        root.addLayout(source_row)
+
         # --- File selection row -----------------------------------------
         file_row = QHBoxLayout()
         file_row.setSpacing(12)
@@ -157,6 +205,25 @@ class InputPanel(QWidget):
         file_row.addWidget(self.select_button)
         file_row.addStretch(1)
         root.addLayout(file_row)
+
+        # --- Stream URL field (shown only in stream mode, Req 11.2) ------
+        self.stream_url_widget = QWidget()
+        stream_layout = QHBoxLayout(self.stream_url_widget)
+        stream_layout.setContentsMargins(0, 0, 0, 0)
+        stream_layout.setSpacing(12)
+        stream_label = QLabel("Stream URL")
+        stream_label.setMinimumWidth(180)
+        stream_layout.addWidget(stream_label)
+        self.stream_url_edit = QLineEdit()
+        self.stream_url_edit.setMaxLength(_MAX_STREAM_URL_LENGTH)
+        self.stream_url_edit.setPlaceholderText(
+            "rtsp://, rtmp://, http:// or https:// stream URL"
+        )
+        self.stream_url_edit.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.stream_url_edit.textChanged.connect(self._on_stream_url_changed)
+        stream_layout.addWidget(self.stream_url_edit, 1)
+        self.stream_url_widget.setVisible(False)
+        root.addWidget(self.stream_url_widget)
 
         # --- Inline error message ---------------------------------------
         self.error_label = QLabel("")
@@ -306,6 +373,77 @@ class InputPanel(QWidget):
         self.ocr_settings.setVisible(False)
         layout.addWidget(self.ocr_settings)
 
+        # --- Detector backend selector (Req 12.1) -----------------------
+        backend_row = QHBoxLayout()
+        backend_row.setSpacing(12)
+        backend_label = QLabel("Detector backend")
+        backend_label.setMinimumWidth(180)
+        backend_row.addWidget(backend_label)
+        self.detector_combo = QComboBox()
+        self.detector_combo.addItems([_BACKEND_YOLO, _BACKEND_REKOGNITION])
+        self.detector_combo.setCurrentText(_BACKEND_YOLO)
+        self.detector_combo.currentTextChanged.connect(self.on_detector_backend_changed)
+        backend_row.addWidget(self.detector_combo)
+        backend_row.addStretch(1)
+        layout.addLayout(backend_row)
+
+        # --- AWS region field (shown only for Rekognition, Req 12.2) -----
+        self.aws_region_widget = QWidget()
+        region_layout = QHBoxLayout(self.aws_region_widget)
+        region_layout.setContentsMargins(24, 0, 0, 0)
+        region_layout.setSpacing(12)
+        region_label = QLabel("AWS region")
+        region_label.setMinimumWidth(156)
+        region_layout.addWidget(region_label)
+        self.aws_region_edit = QLineEdit()
+        self.aws_region_edit.setMaxLength(_MAX_AWS_REGION_LENGTH)
+        self.aws_region_edit.setText("us-east-1")
+        self.aws_region_edit.setToolTip("AWS region for Rekognition (1\u201364 characters).")
+        self.aws_region_edit.textChanged.connect(self._on_aws_region_changed)
+        region_layout.addWidget(self.aws_region_edit)
+        region_layout.addStretch(1)
+        self.aws_region_widget.setVisible(False)
+        layout.addWidget(self.aws_region_widget)
+
+        # --- Detection interval spinbox (Req 13.1) ----------------------
+        interval_row = QHBoxLayout()
+        interval_row.setSpacing(12)
+        interval_label = QLabel("Detection interval")
+        interval_label.setMinimumWidth(180)
+        interval_row.addWidget(interval_label)
+        self.detect_interval_spin = QSpinBox()
+        self.detect_interval_spin.setRange(_DETECT_INTERVAL_MIN, _DETECT_INTERVAL_MAX)
+        self.detect_interval_spin.setSingleStep(1)
+        self.detect_interval_spin.setValue(1)
+        self.detect_interval_spin.setToolTip("Run detection every N frames (1\u201360).")
+        self.detect_interval_spin.valueChanged.connect(self._on_detect_interval_changed)
+        interval_row.addWidget(self.detect_interval_spin)
+        interval_row.addStretch(1)
+        layout.addLayout(interval_row)
+
+        # Recommendation shown only for the Rekognition backend (Req 13.3).
+        self.rekognition_hint = QLabel(_REKOGNITION_INTERVAL_HINT)
+        self.rekognition_hint.setWordWrap(True)
+        self.rekognition_hint.setStyleSheet(f"color: {_GRAY};")
+        self.rekognition_hint.setVisible(False)
+        layout.addWidget(self.rekognition_hint)
+
+        # Privacy note shown for Rekognition + plate reading (Req 12.9).
+        self.privacy_note = QLabel(_PRIVACY_NOTE)
+        self.privacy_note.setWordWrap(True)
+        self.privacy_note.setStyleSheet(f"color: {_TEAL_DARK}; font-weight: 600;")
+        self.privacy_note.setVisible(False)
+        layout.addWidget(self.privacy_note)
+
+        # --- No-output mode toggle (Req 15.1) ---------------------------
+        self.no_output_toggle = QCheckBox("Disable output video (results table only)")
+        self.no_output_toggle.setToolTip(
+            "When enabled, no annotated output video is written, so processing "
+            "runs faster."
+        )
+        self.no_output_toggle.toggled.connect(self.on_no_output_toggled)
+        layout.addWidget(self.no_output_toggle)
+
         # --- Output path -------------------------------------------------
         out_row = QHBoxLayout()
         out_row.setSpacing(12)
@@ -349,6 +487,29 @@ class InputPanel(QWidget):
                 self.ocr_language.setCurrentText(s.ocr_language)
 
             self.ocr_interval.setValue(max(1, min(100, int(s.ocr_interval))))
+
+            # --- Extension fields (Req 11/12/13/15) ---------------------
+            self.source_mode_combo.setCurrentText(
+                _SOURCE_MODE_STREAM if s.source_mode == "stream" else _SOURCE_MODE_FILE
+            )
+            self.detector_combo.setCurrentText(
+                _BACKEND_REKOGNITION
+                if s.detector_backend == "rekognition"
+                else _BACKEND_YOLO
+            )
+            if isinstance(s.aws_region, str) and s.aws_region.strip():
+                self.aws_region_edit.setText(s.aws_region)
+            self.detect_interval_spin.setValue(
+                max(_DETECT_INTERVAL_MIN, min(_DETECT_INTERVAL_MAX, int(s.detect_interval)))
+            )
+            self.no_output_toggle.setChecked(bool(s.no_output))
+
+            # Sync conditional visibility/enabled state to restored values.
+            # (setCurrentText only emits when the value changes, so apply
+            # the handlers explicitly while still in the loading guard.)
+            self.on_source_mode_changed(self.source_mode_combo.currentText())
+            self.on_detector_backend_changed(self.detector_combo.currentText())
+            self.on_no_output_toggled(self.no_output_toggle.isChecked())
         finally:
             self._loading = False
 
@@ -415,7 +576,7 @@ class InputPanel(QWidget):
         if metadata is None:
             self._metadata = None
             self.summary_card.setVisible(False)
-            self.start_button.setEnabled(False)
+            self._update_start_enabled()
             self._show_error(
                 "This file could not be opened. The format may be unsupported "
                 "or the file may be corrupt. Choose a different file."
@@ -426,7 +587,7 @@ class InputPanel(QWidget):
         self._metadata = metadata
         self._populate_summary(metadata)
         self.summary_card.setVisible(True)
-        self.start_button.setEnabled(True)
+        self._update_start_enabled()
 
         # Default the output path to the input directory unless the user has
         # explicitly chosen a custom path.
@@ -484,6 +645,7 @@ class InputPanel(QWidget):
 
     def _on_ocr_toggled(self, enabled: bool) -> None:
         self.ocr_settings.setVisible(enabled)
+        self._update_privacy_note()
         self._save_settings(ocr_enabled=enabled)
 
     def _on_ocr_language_changed(self, language: str) -> None:
@@ -491,6 +653,79 @@ class InputPanel(QWidget):
 
     def _on_ocr_interval_changed(self, interval: int) -> None:
         self._save_settings(ocr_interval=interval)
+
+    # ------------------------------------------------------------------
+    # Source mode / backend / interval / no-output handlers (Req 11–15)
+    # ------------------------------------------------------------------
+
+    def _source_mode(self) -> str:
+        """Return the internal source mode value: 'file' or 'stream'."""
+        return (
+            "stream"
+            if self.source_mode_combo.currentText() == _SOURCE_MODE_STREAM
+            else "file"
+        )
+
+    def _detector_backend(self) -> str:
+        """Return the internal backend value: 'yolo' or 'rekognition'."""
+        return (
+            "rekognition"
+            if self.detector_combo.currentText() == _BACKEND_REKOGNITION
+            else "yolo"
+        )
+
+    def _update_start_enabled(self) -> None:
+        """Enable Start in stream mode, or in file mode once a video loads."""
+        if self._source_mode() == "stream":
+            self.start_button.setEnabled(True)
+        else:
+            self.start_button.setEnabled(self._metadata is not None)
+
+    def _update_privacy_note(self) -> None:
+        """Show the privacy note only for Rekognition + plate reading (Req 12.9)."""
+        show = self._detector_backend() == "rekognition" and self.ocr_toggle.isChecked()
+        self.privacy_note.setVisible(show)
+
+    def on_source_mode_changed(self, mode: str) -> None:
+        """Toggle file vs stream controls (Req 11.2/11.3)."""
+        is_stream = mode == _SOURCE_MODE_STREAM
+        # Hide and disable the file selection control in stream mode so file
+        # and stream input can never both be active for one session.
+        self.select_button.setVisible(not is_stream)
+        self.select_button.setEnabled(not is_stream)
+        self.stream_url_widget.setVisible(is_stream)
+        # The metadata summary only applies to file input.
+        self.summary_card.setVisible(not is_stream and self._metadata is not None)
+        self._clear_error()
+        self._update_start_enabled()
+        self._save_settings(source_mode=self._source_mode())
+
+    def _on_stream_url_changed(self, _text: str) -> None:
+        # Clear any prior inline error as the user edits the URL.
+        if not self._loading:
+            self._clear_error()
+
+    def on_detector_backend_changed(self, backend: str) -> None:
+        """Toggle AWS region field and Rekognition hints (Req 12.2/12.3/13.3)."""
+        is_rekognition = backend == _BACKEND_REKOGNITION
+        self.aws_region_widget.setVisible(is_rekognition)
+        self.rekognition_hint.setVisible(is_rekognition)
+        self._update_privacy_note()
+        self._save_settings(detector_backend=self._detector_backend())
+
+    def _on_aws_region_changed(self, _text: str) -> None:
+        if not self._loading:
+            self._clear_error()
+            self._save_settings(aws_region=self.aws_region_edit.text())
+
+    def _on_detect_interval_changed(self, value: int) -> None:
+        self._save_settings(detect_interval=int(value))
+
+    def on_no_output_toggled(self, enabled: bool) -> None:
+        """Disable the output path selector when no-output is enabled (Req 15.2/15.3/15.6)."""
+        self.output_path_edit.setEnabled(not enabled)
+        self.output_browse_button.setEnabled(not enabled)
+        self._save_settings(no_output=enabled)
 
     def _select_output_path(self) -> None:
         start_dir = self.output_path_edit.text() or ""
@@ -514,10 +749,25 @@ class InputPanel(QWidget):
 
     def build_config(self) -> ProcessingConfig:
         """Collect all parameters into a :class:`ProcessingConfig`."""
-        video_path = self._metadata.file_path if self._metadata else ""
-        output_path = self.output_path_edit.text()
-        if not output_path and video_path:
-            output_path = derive_default_output_path(video_path)
+        source_mode = self._source_mode()
+        detector_backend = self._detector_backend()
+
+        if source_mode == "stream":
+            video_path = ""
+            stream_url = self.stream_url_edit.text().strip()
+        else:
+            video_path = self._metadata.file_path if self._metadata else ""
+            stream_url = ""
+
+        no_output = self.no_output_toggle.isChecked()
+        if no_output:
+            output_path: str | None = None
+        else:
+            output_path = self.output_path_edit.text()
+            if not output_path and video_path:
+                output_path = derive_default_output_path(video_path)
+
+        aws_region = self.aws_region_edit.text().strip() or "us-east-1"
 
         return ProcessingConfig(
             video_path=video_path,
@@ -527,9 +777,43 @@ class InputPanel(QWidget):
             ocr_languages=[self.ocr_language.currentText() or "en"],
             ocr_interval=self.ocr_interval.value(),
             plate_model_path=None,
+            source_mode=source_mode,
+            stream_url=stream_url,
+            detector_backend=detector_backend,
+            aws_region=aws_region,
+            detect_interval=self.detect_interval_spin.value(),
+            no_output=no_output,
         )
 
+    def validate_before_start(self) -> str | None:
+        """Validate input selections before starting (Req 11.5/11.12/12.5).
+
+        Returns an inline error message when invalid (without mutating field
+        state), or ``None`` when the current configuration may start.
+        """
+        if self._source_mode() == "stream":
+            url = self.stream_url_edit.text()
+            if not url.strip():
+                return "Enter a stream URL to start processing."
+            if not is_valid_stream_url(url):
+                return (
+                    "Enter a stream URL beginning with rtsp://, rtmp://, "
+                    "http:// or https://."
+                )
+
+        if self._detector_backend() == "rekognition":
+            if not is_valid_aws_region(self.aws_region_edit.text()):
+                return "Enter an AWS region to use AWS Rekognition."
+
+        return None
+
     def _on_start_clicked(self) -> None:
-        if self._metadata is None:
+        error = self.validate_before_start()
+        if error is not None:
+            self._show_error(error)
             return
+        # In file mode a validated video is required before starting.
+        if self._source_mode() == "file" and self._metadata is None:
+            return
+        self._clear_error()
         self.start_requested.emit(self.build_config())

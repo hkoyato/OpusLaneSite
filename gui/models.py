@@ -9,13 +9,21 @@ from dataclasses import dataclass, field
 class ProcessingConfig:
     """Immutable configuration for a processing session."""
 
-    video_path: str
-    output_path: str
+    video_path: str  # populated in file mode, "" in stream mode
+    output_path: str | None  # None when No_Output_Mode is enabled (Req 15)
     confidence: float  # 0.1 – 1.0
     ocr_enabled: bool
     ocr_languages: list[str] = field(default_factory=lambda: ["en"])
     ocr_interval: int = 10  # 1 – 100
     plate_model_path: str | None = None
+    # Input source (Req 11)
+    source_mode: str = "file"  # "file" | "stream"
+    stream_url: str = ""  # populated in stream mode, "" in file mode
+    # Detector backend (Req 12) and interval (Req 13)
+    detector_backend: str = "yolo"  # "yolo" | "rekognition"
+    aws_region: str = "us-east-1"  # used when detector_backend == "rekognition"
+    detect_interval: int = 1  # 1 – 60
+    no_output: bool = False  # mirrors output_path is None (Req 15)
 
 
 @dataclass
@@ -58,3 +66,9 @@ class AppSettings:
     window_height: int = 800
     window_x: int | None = None
     window_y: int | None = None
+    # Extension persisted prefs (Req 12, 13, 15, 11)
+    detector_backend: str = "yolo"  # "yolo" | "rekognition"
+    aws_region: str = "us-east-1"  # 1 – 64 chars
+    detect_interval: int = 1  # 1 – 60
+    no_output: bool = False
+    source_mode: str = "file"  # "file" | "stream"

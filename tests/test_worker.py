@@ -88,6 +88,11 @@ class FakePipelineAdapter:
         # (annotated_frame, active_tracks, active_count)
         return frame.copy(), [], self._active_count
 
+    def finalize(self, tracks: list) -> list:
+        # Identity finalize: mirrors PipelineAdapter.finalize's no-op path
+        # (plate dedup disabled) so WorkerThread._emit_results can call it.
+        return tracks
+
 
 def _make_config(**overrides) -> ProcessingConfig:
     base = dict(

@@ -35,7 +35,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from gui.assets import DEFAULT_VEHICLE_MODEL, models_dir, resolve_model
+from gui.assets import DEFAULT_VEHICLE_MODEL, ensure_model, models_dir, resolve_model
 from gui.input_panel import InputPanel
 from gui.models import ProcessingConfig
 from gui.processing_view import ProcessingView
@@ -58,6 +58,27 @@ _MIN_HEIGHT = 700
 # Maximum number of captured log lines retained in the panel (Requirement 6.4).
 _MAX_LOG_LINES = 10000
 
+# Substrings that mark an AWS Rekognition failure as a credentials problem
+# (missing/invalid credentials) versus a region/service/network problem. The
+# worker emits errors as ``f"{type(exc).__name__}: {exc}"`` so the boto3
+# exception type name appears in the message string (Requirements 12.6, 12.7).
+_AWS_CREDENTIAL_MARKERS = (
+    "nocredentialserror",
+    "partialcredentials",
+    "unrecognizedclient",
+    "invalidsignature",
+    "invalidaccesskey",
+    "credential",
+)
+_AWS_SERVICE_MARKERS = (
+    "clienterror",
+    "endpointconnectionerror",
+    "endpointconnection",
+    "botocoreerror",
+    "invalidregion",
+    "throttl",
+)
+
 # Privacy trust note shown in the footer across all views (Requirement 1.5).
 _PRIVACY_NOTE = (
     "LaneSight uses temporary anonymous vehicle session IDs for wait-time "
@@ -76,9 +97,8 @@ _NAV_ENTRIES = [
     ("input", "Input", True),
     ("processing", "Processing", True),
     ("results", "Results", True),
-    ("dashboard", "Dashboard", False),
-    ("streams", "Stream config", False),
-    ("zones", "Zone editor", False),
+    # Future views (dashboard, stream config, zone editor) will be added here
+    # once implemented. Hidden until then to avoid showing non-functional items.
 ]
 
 _VIEW_TO_ROW = {"input": _NAV_INPUT, "processing": _NAV_PROCESSING, "results": _NAV_RESULTS}
@@ -99,8 +119,9 @@ class MainWindow(QMainWindow):
         # populate the results view on completion.
         self._session_fps: float = 0.0
         self._session_ocr_enabled = False
-        self._session_output_path = ""
+        self._session_output_path: str | None = ""
         self._session_video_name = ""
+        self._session_detector_backend = "yolo"
         self._total_frames = 0
         self._skipped_frames = 0
 
@@ -403,25 +424,44 @@ class MainWindow(QMainWindow):
 
     def start_processing(self, config: ProcessingConfig) -> None:
         """Validate preconditions, launch the worker, and show processing view."""
-        # Requirement 8.1 — vehicle detection model must be available. The
-        # resolver searches assets/models/ and other known locations so the
-        # model is found regardless of the current working directory.
-        model_available = resolve_model(_MODEL_FILENAME) is not None or (
-            config.plate_model_path is not None
-            and Path(config.plate_model_path).exists()
-        )
-        if not model_available:
-            QMessageBox.critical(
-                self,
-                "Detection model missing",
-                f"The vehicle detection model '{_MODEL_FILENAME}' was not found.\n\n"
-                f"Place '{_MODEL_FILENAME}' in '{models_dir()}' (or select a model "
-                f"via settings), then try again.",
+        # Requirement 8.1 — the local vehicle detection model must be available.
+        # This check applies only to the local YOLOv8 backend; the AWS
+        # Rekognition backend needs no local model (Requirement 12.4), so it is
+        # skipped when detector_backend == "rekognition".
+        if config.detector_backend != "rekognition":
+            has_plate_model = (
+                config.plate_model_path is not None
+                and Path(config.plate_model_path).exists()
             )
-            return
+            model_available = resolve_model(_MODEL_FILENAME) is not None
+            # Attempt a one-time auto-download of the default model when it is
+            # missing (Requirement 8.1). Ultralytics fetches the official
+            # weights into assets/models/. Use a wait cursor since the download
+            # blocks briefly on first run.
+            if not model_available and not has_plate_model:
+                QApplication.setOverrideCursor(Qt.WaitCursor)
+                try:
+                    model_available = ensure_model(_MODEL_FILENAME) is not None
+                finally:
+                    QApplication.restoreOverrideCursor()
+            if not model_available and not has_plate_model:
+                QMessageBox.critical(
+                    self,
+                    "Detection model missing",
+                    f"The vehicle detection model '{_MODEL_FILENAME}' was not "
+                    f"found and could not be downloaded automatically.\n\n"
+                    f"Check your internet connection, or place "
+                    f"'{_MODEL_FILENAME}' in '{models_dir()}' (or select a model "
+                    f"via settings), then try again.",
+                )
+                return
 
-        # Requirement 8.2 — output path directory must be writable.
-        if not self._output_path_writable(config.output_path):
+        # Requirement 8.2 — output path directory must be writable. Skipped in
+        # No_Output_Mode (config.output_path is None — Requirement 15.4) and for
+        # streams without recording, where no output file is written.
+        if config.output_path is not None and not self._output_path_writable(
+            config.output_path
+        ):
             QMessageBox.critical(
                 self,
                 "Output path not writable",
@@ -431,10 +471,16 @@ class MainWindow(QMainWindow):
             )
             return
 
-        # Capture session metadata for the results view (best-effort).
+        # Capture session metadata for the results view (best-effort). In stream
+        # mode video_path is "" so the stream URL identifies the session in the
+        # window title (Requirements 11.x).
+        is_stream = config.source_mode == "stream"
         self._session_ocr_enabled = config.ocr_enabled
-        self._session_output_path = config.output_path
-        self._session_video_name = os.path.basename(config.video_path)
+        self._session_output_path = config.output_path  # may be None
+        self._session_detector_backend = config.detector_backend
+        self._session_video_name = (
+            config.stream_url if is_stream else os.path.basename(config.video_path)
+        )
         self._session_fps = self._lookup_session_fps()
         self._total_frames = 0
         self._skipped_frames = 0
@@ -446,17 +492,33 @@ class MainWindow(QMainWindow):
         self._worker.progress.connect(self._track_progress)
         self._worker.frame_error.connect(self.processing_view.on_frame_error)
         self._worker.frame_error.connect(self._track_frame_error)
+        self._worker.connecting.connect(self.processing_view.on_connecting)
+        self._worker.reconnect_status.connect(
+            self.processing_view.on_reconnect_status
+        )
         self._worker.processing_finished.connect(self.on_worker_finished)
         self._worker.error.connect(self.on_worker_error)
         self._worker.log_output.connect(self._on_log_output)
         self._worker.finished.connect(self._on_thread_finished)
 
         self.processing_view.reset()
+        # Stream mode shows indeterminate progress and a "Stop" label (Req 11.6,
+        # 11.10); file mode keeps determinate progress.
+        self.processing_view.set_stream_mode(is_stream)
         self.switch_view("processing")
         self._worker.start()
 
     def on_worker_finished(self, results: list) -> None:
-        """Handle pipeline completion — populate and switch to the results view."""
+        """Handle pipeline completion — populate and switch to the results view.
+
+        Producing results clears any pending cancellation flag: a stream "Stop"
+        emits ``processing_finished`` with the tracks collected so far (Req
+        11.10), and the subsequent ``QThread.finished`` handler must not then
+        override the Results_View by returning to the input view. A file
+        "Cancel" never reaches here (no completion signal is emitted), so it
+        still returns to the input view via ``_on_thread_finished``.
+        """
+        self._cancelling = False
         self.results_view.display_results(
             results,
             self._session_fps,
@@ -468,13 +530,52 @@ class MainWindow(QMainWindow):
         self.switch_view("results")
 
     def on_worker_error(self, error_msg: str, frame_idx: int) -> None:
-        """Handle pipeline error — show a dialog and return to the input view."""
-        QMessageBox.critical(
-            self,
+        """Handle a pipeline error — show a dialog and return to the input view.
+
+        AWS Rekognition failures are classified into credentials errors
+        (Requirement 12.6) versus region/service/network errors
+        (Requirement 12.7) by inspecting the worker's error message, which
+        carries the boto3 exception type name. Returning to the Video_Input_Panel
+        retains the user's selections (the panel persists them via settings).
+        """
+        title, body = self._classify_error(error_msg, frame_idx)
+        QMessageBox.critical(self, title, body)
+        self.switch_view("input")
+
+    @staticmethod
+    def _classify_error(error_msg: str, frame_idx: int) -> tuple[str, str]:
+        """Map a worker error message to a (dialog title, body) pair.
+
+        The worker emits errors as ``f"{type(exc).__name__}: {exc}"``, so boto3
+        exception type names appear verbatim. Credentials markers take priority
+        over service/region markers; anything else falls back to the generic
+        processing-error message.
+        """
+        lowered = error_msg.lower()
+
+        if any(marker in lowered for marker in _AWS_CREDENTIAL_MARKERS):
+            return (
+                "AWS credentials error",
+                "AWS Rekognition could not authenticate. Missing or invalid AWS "
+                "credentials stopped processing.\n\nConfigure valid AWS "
+                "credentials (environment variables, shared config, or instance "
+                "profile), then try again.\n\n"
+                f"Details: {error_msg}",
+            )
+
+        if any(marker in lowered for marker in _AWS_SERVICE_MARKERS):
+            return (
+                "AWS Rekognition error",
+                "An AWS Rekognition API call failed due to a region, network, or "
+                "service error. Processing stopped.\n\nVerify the AWS region and "
+                "your network connection, then try again.\n\n"
+                f"Details: {error_msg}",
+            )
+
+        return (
             "Processing error",
             f"Processing stopped at frame {frame_idx}.\n\n{error_msg}",
         )
-        self.switch_view("input")
 
     def _on_cancel_requested(self) -> None:
         """User clicked Cancel in the processing view."""

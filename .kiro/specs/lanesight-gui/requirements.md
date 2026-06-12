@@ -17,6 +17,14 @@ The Opus LaneSight GUI is a self-contained, lightweight Windows desktop applicat
 - **Confidence_Threshold**: A floating-point value between 0 and 1 that controls the minimum detection score for vehicle identification.
 - **OCR_Toggle**: A user-facing control that enables or disables license plate OCR processing during a session.
 - **Brand_Theme**: The visual appearance system implementing Opus color palette, Roboto typography, card-based layout, and spacing rules per the UI guidelines.
+- **Stream_Source**: A live video input identified by an RTSP, RTMP, or HTTP stream URL, processed indefinitely until the user stops it, as an alternative to a local video file.
+- **Input_Source_Mode**: The mutually exclusive selection between file input (a local video file) and stream input (a Stream_Source URL) for a Processing_Session.
+- **Detector_Backend**: The selectable vehicle detection engine, either the local YOLOv8 detector ("yolo") or the AWS Rekognition cloud detector ("rekognition").
+- **AWS_Region**: The AWS region string (e.g., "us-east-1") used for AWS Rekognition API calls when the Rekognition Detector_Backend is selected.
+- **Detection_Interval**: A positive integer N controlling that vehicle detection runs every N frames, with Kalman prediction filling the gaps between detection frames, to reduce GPU load (YOLO) or API calls and cost (Rekognition).
+- **Plate_Deduplication**: The post-processing step that merges tracks with the same or fuzzy-similar plate text into a single result, combining frame ranges and hit counts and selecting the best plate text, applied only when plate text reading is enabled.
+- **No_Output_Mode**: A configuration option that disables writing the annotated output video for faster processing.
+- **Plate_Text_Reading**: Any capability that reads license plate text, including EasyOCR (local OCR) and AWS Rekognition DetectText; it is opt-in and disabled by default to preserve the privacy-preserving positioning.
 
 ## Requirements
 
@@ -152,3 +160,77 @@ The Opus LaneSight GUI is a self-contained, lightweight Windows desktop applicat
 3. THE GUI_Application SHALL organize its source code into separate modules for: main window/navigation, input panel, processing view, results view, settings, worker thread, and brand theme, each in its own Python file within a gui/ package directory.
 4. THE GUI_Application SHALL use Qt signal/slot connections for all communication between the Worker_Thread and GUI views, with no direct method calls from the Worker_Thread to view widgets.
 5. THE GUI_Application SHALL implement each view (Video_Input_Panel, Processing_View, Results_View) as an independent widget class that does not import or directly reference other view modules, so that a new view can be added without modifying existing view source files.
+
+### Requirement 11: Live stream input
+
+**User Story:** As a station operator, I want to process a live RTSP/RTMP/HTTP camera stream instead of a file, so that I can monitor station flow in real time.
+
+#### Acceptance Criteria
+
+1. THE Video_Input_Panel SHALL provide an Input_Source_Mode selector with two mutually exclusive options, "Video file" and "Live stream", defaulting to "Video file".
+2. WHEN the user selects the "Live stream" Input_Source_Mode, THE Video_Input_Panel SHALL display a stream URL text field that accepts URLs beginning with the rtsp://, rtmp://, http://, or https:// scheme up to a maximum of 2048 characters, and SHALL hide the file selection control.
+3. WHILE the "Live stream" Input_Source_Mode is selected, THE Video_Input_Panel SHALL disable the file selection control such that file input and stream input cannot both be active for a single Processing_Session.
+4. WHEN the user enters a stream URL that begins with rtsp://, rtmp://, http://, or https:// and clicks "Start processing", THE GUI_Application SHALL pass the stream URL to the Pipeline as the `stream_url` parameter and SHALL pass `video_path` as empty.
+5. IF the user clicks "Start processing" in "Live stream" Input_Source_Mode with a stream URL field that is empty or contains only whitespace, THEN THE GUI_Application SHALL display an inline error message indicating that a stream URL is required, SHALL retain the field state, and SHALL NOT start processing.
+6. WHILE processing a Stream_Source, THE Processing_View SHALL display an indeterminate progress indicator instead of a percentage progress bar, because the total frame count of a Stream_Source is unknown.
+7. WHILE processing a Stream_Source, THE Processing_View SHALL update the live statistics for elapsed time in seconds, active vehicle count, and effective frames-per-second at least once per second.
+8. WHEN the Stream_Source is interrupted, THE Processing_View SHALL display a reconnection status message indicating the current reconnection attempt number out of a maximum of 5 attempts, retried at 2-second intervals, and SHALL update this message within 1 second of each new attempt.
+9. IF the Stream_Source cannot be re-established after 5 reconnection attempts, THEN THE GUI_Application SHALL stop processing, display a message indicating the stream was lost, and switch to the Results_View showing the tracks collected before the interruption.
+10. THE Processing_View SHALL provide a "Stop" control that, when clicked during Stream_Source processing, stops the Worker_Thread within 3 seconds, releases stream resources, and switches to the Results_View showing the tracks collected up to that point.
+11. WHERE the user enables recording for a Stream_Source by specifying an output path, THE GUI_Application SHALL record the annotated stream to that output file while processing continues indefinitely.
+12. IF the user clicks "Start processing" in "Live stream" Input_Source_Mode with a non-empty stream URL that does not begin with rtsp://, rtmp://, http://, or https://, THEN THE GUI_Application SHALL display an inline error message indicating that a supported stream URL scheme is required, SHALL retain the entered URL, and SHALL NOT start processing.
+13. WHEN the user starts processing a Stream_Source and before the first frame is received, THE Processing_View SHALL display a connecting status message identifying the target stream URL.
+
+### Requirement 12: Detection backend selection
+
+**User Story:** As a station operator, I want to choose between the local YOLOv8 detector and the AWS Rekognition cloud detector, so that I can match detection to the available hardware or cloud budget.
+
+#### Acceptance Criteria
+
+1. THE Video_Input_Panel SHALL provide a Detector_Backend selector with two mutually exclusive options, "Local YOLOv8" and "AWS Rekognition", defaulting to "Local YOLOv8".
+2. WHEN the user selects the "AWS Rekognition" Detector_Backend, THE Video_Input_Panel SHALL display an editable AWS_Region text field of 1 to 64 characters pre-filled with "us-east-1".
+3. WHILE the "Local YOLOv8" Detector_Backend is selected, THE Video_Input_Panel SHALL hide the AWS_Region field.
+4. WHEN the user starts processing, THE GUI_Application SHALL pass the value "yolo" for the "Local YOLOv8" option or "rekognition" for the "AWS Rekognition" option, together with the AWS_Region value, to the Pipeline `process_video` function using the `detector_backend` and `aws_region` parameter names.
+5. IF the user clicks "Start processing" with the "AWS Rekognition" Detector_Backend selected and an AWS_Region field that is empty or contains only whitespace, THEN THE GUI_Application SHALL display an inline error message indicating that an AWS region is required, SHALL retain the current selections, and SHALL NOT start processing.
+6. IF an AWS Rekognition API call fails due to missing or invalid AWS credentials, THEN THE GUI_Application SHALL stop processing, display an error message identifying the failure as an AWS credentials error, retain the current selections, and return to the Video_Input_Panel.
+7. IF an AWS Rekognition API call fails due to a region, network, or service error, THEN THE GUI_Application SHALL stop processing, display an error message describing the AWS API failure, retain the current selections, and return to the Video_Input_Panel.
+8. THE Plate_Text_Reading capability SHALL default to disabled and SHALL require explicit opt-in by the user before any plate text is read by either EasyOCR or AWS Rekognition DetectText.
+9. WHERE the "AWS Rekognition" Detector_Backend is selected with Plate_Text_Reading enabled, THE Video_Input_Panel SHALL display the privacy note from Requirement 1.5 indicating that reading plate text is opt-in and used for development and testing only, consistent with the privacy-preserving positioning.
+
+### Requirement 13: Detection interval control
+
+**User Story:** As a station operator, I want to run detection only every N frames, so that I can reduce GPU load or AWS API cost while Kalman prediction fills the gaps.
+
+#### Acceptance Criteria
+
+1. THE Video_Input_Panel SHALL provide a Detection_Interval numeric control with a minimum value of 1, a maximum value of 60, a step increment of 1, and a default value of 1.
+2. WHEN the user starts processing, THE GUI_Application SHALL pass the current Detection_Interval value as a positive integer to the Pipeline `process_video` function using the `detect_interval` parameter name.
+3. WHILE the "AWS Rekognition" Detector_Backend is selected, THE Video_Input_Panel SHALL display a visible recommendation indicating the Detection_Interval should be set between 5 and 10 to reduce API calls and cost.
+4. IF the user enters a Detection_Interval value below 1 via manual text entry, THEN THE GUI_Application SHALL clamp the value to 1, retain the control in an editable state, and display a tooltip indicating the valid range is 1 to 60.
+5. IF the user enters a Detection_Interval value above 60 via manual text entry, THEN THE GUI_Application SHALL clamp the value to 60, retain the control in an editable state, and display a tooltip indicating the valid range is 1 to 60.
+6. IF the user enters a non-integer or non-numeric Detection_Interval value via manual text entry, THEN THE GUI_Application SHALL reject the entry, restore the most recent valid integer value, and display a tooltip indicating the valid range is 1 to 60.
+
+### Requirement 14: Deduplicated results display
+
+**User Story:** As a station operator, I want results to merge duplicate detections of the same plate, so that each physical vehicle appears once in the wait-time table.
+
+#### Acceptance Criteria
+
+1. WHEN Plate_Text_Reading is enabled and Pipeline processing completes, THE Results_View SHALL display the Plate_Deduplication results in which every set of tracks whose plate text is identical, or is matched after normalizing the OCR-confusable characters (O/0, I/1, S/5, B/8), is merged into exactly one row.
+2. THE Results_View SHALL display each merged row using a frame span from the smallest first_frame to the largest last_frame in the group, the enter and leave times derived from those frames, the summed hit counts of the group, and the single best plate text selected by the Pipeline for the group.
+3. IF a track has no plate text or plate text shorter than 3 characters, THEN THE Results_View SHALL display that track as its own row and SHALL NOT merge it with any other track.
+4. WHILE Plate_Text_Reading is disabled, THE Results_View SHALL display every track as a separate row without Plate_Deduplication, because no plate text is available to merge on.
+5. THE Results_View SHALL compute the total vehicles tracked and the summary statistics from the deduplicated set of rows when Plate_Deduplication has been applied.
+
+### Requirement 15: No-output mode toggle
+
+**User Story:** As a station operator, I want to disable writing the annotated output video, so that processing runs faster when I only need the results table.
+
+#### Acceptance Criteria
+
+1. THE Video_Input_Panel SHALL provide a No_Output_Mode toggle that defaults to disabled when no persisted value is available from the configuration mechanism defined in Requirement 5.
+2. WHILE No_Output_Mode is enabled, THE Video_Input_Panel SHALL disable the output file path selector control such that the operator cannot edit, browse to, or change the output path.
+3. WHILE No_Output_Mode is disabled, THE Video_Input_Panel SHALL enable the output file path selector control so the operator can edit and browse to the output path.
+4. WHEN the user starts processing with No_Output_Mode enabled, THE GUI_Application SHALL invoke the Pipeline with output_path set to None (equivalent to the existing `--no-output` flag) such that no annotated output video file is written.
+5. WHILE No_Output_Mode is enabled, THE Results_View SHALL omit the output video file path display and the open-containing-folder control defined in Requirement 4.4, and SHALL display text indicating that no output video was written.
+6. WHEN the user changes the No_Output_Mode toggle state, THE GUI_Application SHALL persist the new toggle state using the configuration mechanism defined in Requirement 5 within 2 seconds of the change so that it is restored on the next application session.

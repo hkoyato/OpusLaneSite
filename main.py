@@ -220,8 +220,12 @@ def process_video(
         )
     else:
         print("Using YOLOv8 local detector")
+        from gui.assets import ensure_model, resolve_model_str
+
+        # Auto-download the default model into assets/models/ when missing.
+        ensure_model()
         detector = VehicleDetector(
-            vehicle_model_path="yolov8n.pt",
+            vehicle_model_path=resolve_model_str(),
             plate_model_path=plate_model_path,
             confidence=confidence,
         )

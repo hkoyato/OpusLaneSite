@@ -159,6 +159,11 @@ class FakePipelineAdapter:
             time.sleep(self._per_frame_delay)
         return frame.copy(), [], self._active_count
 
+    def finalize(self, tracks: list) -> list:
+        # Identity finalize: mirrors PipelineAdapter.finalize's no-op path
+        # (plate dedup disabled) so WorkerThread._emit_results can call it.
+        return tracks
+
 
 class FakeMessageBox:
     """Non-blocking QMessageBox stand-in that records dialog invocations."""

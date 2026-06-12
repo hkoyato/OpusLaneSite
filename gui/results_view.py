@@ -190,9 +190,9 @@ class ResultsView(QWidget):
         row = QHBoxLayout()
         row.setSpacing(12)
 
-        prefix = QLabel("Output file:")
-        prefix.setProperty("secondary", True)
-        row.addWidget(prefix)
+        self._output_prefix_label = QLabel("Output file:")
+        self._output_prefix_label.setProperty("secondary", True)
+        row.addWidget(self._output_prefix_label)
 
         self._output_path_label = QLabel(_DASH)
         self._output_path_label.setProperty("role", "body")
@@ -208,6 +208,16 @@ class ResultsView(QWidget):
         self._open_folder_btn.clicked.connect(self.open_output_folder)
         self._open_folder_btn.setEnabled(False)
         row.addWidget(self._open_folder_btn)
+
+        # Shown only when processing ran with No_Output_Mode (output_path is None).
+        self._no_output_label = QLabel("No output video written")
+        self._no_output_label.setProperty("role", "body")
+        self._no_output_label.setProperty("secondary", True)
+        self._no_output_label.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
+        )
+        self._no_output_label.setVisible(False)
+        row.addWidget(self._no_output_label, stretch=1)
         return row
 
     # ------------------------------------------------------------------
@@ -219,19 +229,41 @@ class ResultsView(QWidget):
         results: list[TrackResult],
         fps: float,  # noqa: ARG002 - times are precomputed on TrackResult
         ocr_enabled: bool,
-        output_path: str,
+        output_path: str | None,
         skipped_frames: int,
         total_frames: int,
     ) -> None:
         """Populate the table and summary cards from *results*.
 
-        Validates: Requirements 4.1, 4.2, 4.3, 4.4, 4.6, 4.7, 4.8, 8.4
-        """
-        self._output_path = output_path
+        *results* are displayed as received. When plate reading is enabled the
+        worker has already applied Plate_Deduplication (one row per physical
+        plate); when disabled every track is a separate row and the Plate Text /
+        Confidence columns are hidden. Summary statistics are computed from the
+        displayed (deduplicated) row set.
 
-        # Output path + Open folder enablement.
-        self._output_path_label.setText(output_path or _DASH)
-        self._open_folder_btn.setEnabled(bool(output_path))
+        When *output_path* is ``None`` (No_Output_Mode), the output path label
+        and "Open folder" control are hidden and a "No output video written"
+        message is shown instead.
+
+        Validates: Requirements 4.1, 4.2, 4.3, 4.4, 4.6, 4.7, 4.8, 8.4,
+        14.1, 14.4, 14.5, 15.5
+        """
+        self._output_path = output_path or ""
+
+        # Output path row: omit path + Open folder when no output was written.
+        if output_path is None:
+            self._output_prefix_label.setVisible(False)
+            self._output_path_label.setVisible(False)
+            self._open_folder_btn.setVisible(False)
+            self._open_folder_btn.setEnabled(False)
+            self._no_output_label.setVisible(True)
+        else:
+            self._output_prefix_label.setVisible(True)
+            self._output_path_label.setVisible(True)
+            self._output_path_label.setText(output_path or _DASH)
+            self._open_folder_btn.setVisible(True)
+            self._open_folder_btn.setEnabled(bool(output_path))
+            self._no_output_label.setVisible(False)
 
         # Skipped-frame warning (orange, only when > 0).
         if skipped_frames > 0:

@@ -10,8 +10,16 @@ The architecture follows a strict separation between the existing pipeline modul
 1. **PySide6 over PyQt6** — LGPL license avoids commercial licensing requirements; API is identical.
 2. **Single worker thread** — pipeline is I/O + GPU bound; one worker keeps complexity low while maintaining UI responsiveness.
 3. **Adapter pattern for pipeline** — a thin `PipelineAdapter` class translates GUI parameters into pipeline constructor calls without modifying source modules.
-4. **Abstract input source** — `VideoSource` protocol allows file-based input today with RTSP/RTMP swap-in later.
+4. **Abstract input source** — `VideoSource` protocol allows file-based input today, with a sibling `StreamVideoSource` for RTSP/RTMP/HTTP live streams (Requirement 11).
 5. **Settings persistence via JSON** — simple, human-readable, no external dependencies.
+
+**Extension design decisions (Requirements 11–15):**
+6. **Live stream input** — `StreamVideoSource` mirrors the backend stream handling in `main.py` (`cv2.CAP_PROP_BUFFERSIZE=2`, default 25.0 FPS, `total_frames = -1`, up to 5 reconnect attempts at 2s intervals). The `WorkerThread` signals indeterminate progress and reconnection status so the `ProcessingView` never assumes a known frame total. The adapter replicates the backend loop frame-by-frame (it does **not** call `process_video` directly) so per-frame Qt signals can be emitted; the new parameters are threaded through that same loop.
+7. **Selectable detector backend** — the `PipelineAdapter` constructs either `VehicleDetector` (local YOLOv8) or `RekognitionDetector` (AWS) based on `detector_backend`. Both expose the same `detect(frame)` contract returning dicts with `bbox`/`plate_bbox`/`vehicle_conf` and optionally `plate_text`/`plate_text_conf`, so the rest of the loop is backend-agnostic. `RekognitionDetector` uses `boto3` (a new dependency).
+8. **Detection interval** — a validated `detect_interval` (1–60) runs detection every N frames; on skipped frames the adapter calls `tracker.update([], frame_idx, None)` so the Kalman filter predicts between detections, exactly as the backend does.
+9. **Plate deduplication on completion** — the GUI reuses the backend reference algorithm by importing `plates_are_similar`, `normalize_plate`, and `pick_best_plate` from `plate_utils` (and replicates `_deduplicate_by_plate` semantics) rather than re-implementing fuzzy matching. Deduplication is applied only when plate text reading is enabled.
+10. **No-output mode** — when enabled, the adapter skips `cv2.VideoWriter` creation entirely (`output_path = None`) and the `ResultsView` omits the output-path/open-folder affordances.
+11. **Privacy posture preserved** — all plate-text reading (EasyOCR or Rekognition `DetectText`) remains opt-in and disabled by default, consistent with the Opus privacy-preserving positioning.
 
 ## Architecture
 
@@ -32,13 +40,17 @@ graph TB
         WT[WorkerThread - QThread]
         PA[PipelineAdapter]
         VS[VideoSource - AbstractBase]
+        FVS[FileVideoSource]
+        SVS[StreamVideoSource - reconnect]
     end
 
     subgraph Existing Pipeline [Unmodified Modules]
-        DET[VehicleDetector]
+        DET[VehicleDetector - YOLOv8]
+        RKD[RekognitionDetector - AWS boto3]
         TRK[VehicleTracker]
         OCR[PlateOCR + Aggregator]
         APP[AppearanceExtractor]
+        PU[plate_utils - dedup helpers]
     end
 
     MW --> IP
@@ -50,13 +62,19 @@ graph TB
     MW -- "launch worker" --> WT
     WT --> PA
     PA --> VS
-    PA --> DET
+    VS --> FVS
+    VS --> SVS
+    PA -- "detector_backend" --> DET
+    PA -- "detector_backend" --> RKD
     PA --> TRK
     PA --> OCR
     PA --> APP
+    PA -- "on completion" --> PU
 
     WT -- "frame_ready signal" --> PV
     WT -- "progress signal" --> PV
+    WT -- "reconnect_status signal" --> PV
+    WT -- "connecting signal" --> PV
     WT -- "finished signal" --> MW
     WT -- "error signal" --> MW
 
@@ -69,16 +87,34 @@ graph TB
 sequenceDiagram
     participant UI as Main Thread (GUI)
     participant WT as WorkerThread
+    participant VS as VideoSource (File | Stream)
     participant P as Pipeline Modules
 
     UI->>WT: start(config)
-    loop Each Frame
-        WT->>P: detector.detect(frame)
-        WT->>P: tracker.update(detections)
-        WT->>P: ocr.read_plate() [if enabled]
-        WT-->>UI: frame_ready(annotated_frame, frame_idx, track_count)
-        WT-->>UI: progress(frame_idx, total_frames, stats)
+    alt Stream source
+        WT-->>UI: connecting(stream_url)
     end
+    loop Each Frame (until EOF, Stop, or reconnect exhaustion)
+        WT->>VS: read()
+        alt read failed AND stream
+            WT->>VS: reconnect (up to 5 @ 2s)
+            WT-->>UI: reconnect_status(attempt, max)
+        end
+        alt detect_interval boundary (frame_idx % N == 0)
+            WT->>P: detector.detect(frame)  [YOLO or Rekognition]
+            WT->>P: tracker.update(detections, idx, features)
+            WT->>P: aggregator.add_reading() [Rekognition plate_text or OCR]
+        else skipped frame
+            WT->>P: tracker.update([], idx, None)  [Kalman predict]
+        end
+        WT-->>UI: frame_ready(annotated_frame, frame_idx, track_count)
+        alt File source
+            WT-->>UI: progress(frame_idx, total, stats)  [determinate %]
+        else Stream source
+            WT-->>UI: progress(frame_idx, -1, stats)  [indeterminate + elapsed/fps]
+        end
+    end
+    WT->>P: _deduplicate_by_plate(tracks) [if plate reading enabled]
     WT-->>UI: finished(tracks_list)
     UI->>UI: Switch to ResultsView
 ```
@@ -93,7 +129,7 @@ gui/
 ├── processing_view.py  # Live preview, progress bar, stats, cancel
 ├── results_view.py     # Vehicle table, summary cards, export
 ├── settings.py         # SettingsManager (load/save JSON)
-├── worker.py           # WorkerThread (QThread), PipelineAdapter, VideoSource
+├── worker.py           # WorkerThread (QThread), PipelineAdapter, FileVideoSource, StreamVideoSource
 ├── theme.py            # BrandTheme (stylesheet, colors, fonts)
 └── resources/          # Opus logo PNG, app icon .ico
 ```
@@ -156,6 +192,13 @@ class InputPanel(QWidget):
     start_requested = Signal(ProcessingConfig)
 
     def __init__(self, settings: SettingsManager):
+        # Builds, in addition to file/confidence/OCR/output controls:
+        #   - Input_Source_Mode selector (Req 11): "Video file" | "Live stream", default "Video file"
+        #   - stream URL field (shown only in stream mode, max 2048 chars)
+        #   - Detector_Backend selector (Req 12): "Local YOLOv8" | "AWS Rekognition"
+        #   - AWS_Region field (shown only for Rekognition, 1-64 chars, default "us-east-1")
+        #   - Detection_Interval spinbox (Req 13): 1-60, step 1, default 1
+        #   - No_Output_Mode toggle (Req 15), restored from settings
         ...
 
     def select_video_file(self) -> None:
@@ -170,8 +213,36 @@ class InputPanel(QWidget):
         """Accept a dropped file path — validates and updates UI."""
         ...
 
+    def on_source_mode_changed(self, mode: str) -> None:
+        """Req 11.2/11.3: show stream URL field and disable file controls in
+        'Live stream' mode; restore file controls in 'Video file' mode."""
+        ...
+
+    def on_detector_backend_changed(self, backend: str) -> None:
+        """Req 12.2/12.3: show AWS_Region field for Rekognition (default
+        'us-east-1') and hide it for YOLOv8. Req 13.3: show the 5-10
+        detect_interval recommendation when Rekognition is selected.
+        Req 12.9: show the privacy note when Rekognition + plate reading."""
+        ...
+
+    def on_no_output_toggled(self, enabled: bool) -> None:
+        """Req 15.2/15.3: disable the output path selector when enabled,
+        enable it when disabled. Persists via settings (Req 15.6)."""
+        ...
+
+    def validate_before_start(self) -> str | None:
+        """Pure validation invoked on 'Start processing'. Returns an inline
+        error message or None when valid:
+          - Req 11.5: stream mode + empty/whitespace URL -> error
+          - Req 11.12: stream mode + URL without rtsp/rtmp/http/https -> error
+          - Req 12.5: Rekognition + empty/whitespace AWS region -> error
+        Retains field state and does not start when invalid."""
+        ...
+
     def build_config(self) -> ProcessingConfig:
-        """Collect all parameters into a ProcessingConfig dataclass."""
+        """Collect all parameters (including source_mode/stream_url,
+        detector_backend, aws_region, detect_interval, no_output) into a
+        ProcessingConfig dataclass."""
         ...
 ```
 
@@ -184,9 +255,14 @@ class ProcessingView(QWidget):
     """Live processing display with annotated frame preview and progress."""
 
     # Signals
-    cancel_requested = Signal()
+    cancel_requested = Signal()   # "Cancel" (file) and "Stop" (stream) both route here
 
     def __init__(self):
+        # Progress widget supports two modes:
+        #   - determinate QProgressBar (file input, Req 3.4)
+        #   - indeterminate/busy QProgressBar with range (0, 0) (stream, Req 11.6)
+        # Status line for connecting / reconnection messages (Req 11.8/11.13).
+        # The Cancel button is labeled "Stop" in stream mode (Req 11.10).
         ...
 
     @Slot(QImage, int, int)
@@ -197,7 +273,22 @@ class ProcessingView(QWidget):
     @Slot(int, int, float, int, float)
     def on_progress(self, current: int, total: int, elapsed: float,
                     active_count: int, eta: float) -> None:
-        """Update progress bar and statistics labels."""
+        """Update progress and statistics labels. When total == -1 (stream),
+        switch the progress bar to indeterminate and show elapsed time,
+        active vehicle count, and effective FPS instead of a percentage
+        (Req 11.6/11.7)."""
+        ...
+
+    @Slot(str)
+    def on_connecting(self, stream_url: str) -> None:
+        """Req 11.13: before the first stream frame, show a connecting status
+        message identifying the target stream URL."""
+        ...
+
+    @Slot(int, int)
+    def on_reconnect_status(self, attempt: int, max_attempts: int) -> None:
+        """Req 11.8: show 'Reconnecting (attempt/max)...' within 1s of each
+        new attempt during a stream interruption."""
         ...
 
     @Slot(int)
@@ -221,9 +312,16 @@ class ResultsView(QWidget):
         ...
 
     def display_results(self, results: list[TrackResult], fps: float,
-                        ocr_enabled: bool, output_path: str,
+                        ocr_enabled: bool, output_path: str | None,
                         skipped_frames: int, total_frames: int) -> None:
-        """Populate table and compute summary statistics."""
+        """Populate table and compute summary statistics.
+        When ocr_enabled (plate reading) is True, `results` are already the
+        deduplicated rows (Req 14.1/14.5) produced by the WorkerThread, and the
+        Plate Text / Confidence columns are shown. When False, every track is a
+        separate row with those columns hidden (Req 14.4).
+        When output_path is None (No_Output_Mode, Req 15.5), the output path
+        label and open-folder button are hidden and replaced with the text
+        'No output video written'."""
         ...
 
     def sort_by_column(self, column: int) -> None:
@@ -231,7 +329,8 @@ class ResultsView(QWidget):
         ...
 
     def open_output_folder(self) -> None:
-        """Open containing folder in Windows Explorer via os.startfile."""
+        """Open containing folder in Windows Explorer via os.startfile.
+        Hidden/disabled when No_Output_Mode is active (Req 15.5)."""
         ...
 ```
 
@@ -241,34 +340,68 @@ Responsibilities: Execute pipeline in background thread, emit frame/progress/err
 
 ```python
 class VideoSource(Protocol):
-    """Abstract video input — file today, RTSP/RTMP in future."""
+    """Abstract video input — file or live stream."""
     def open(self, source: str) -> bool: ...
     def read(self) -> tuple[bool, np.ndarray | None]: ...
     def get_metadata(self) -> VideoMetadata: ...
+    def is_stream(self) -> bool: ...
     def release(self) -> None: ...
 
 class FileVideoSource:
-    """cv2.VideoCapture wrapper implementing VideoSource for local files."""
+    """cv2.VideoCapture wrapper implementing VideoSource for local files.
+    Reports a known total frame count for determinate progress."""
     ...
+
+class StreamVideoSource:
+    """cv2.VideoCapture wrapper for RTSP/RTMP/HTTP live streams (Req 11).
+
+    Mirrors the backend stream handling in main.py:
+      - cap.set(cv2.CAP_PROP_BUFFERSIZE, 2) to minimize latency
+      - default FPS 25.0 when the stream does not report one
+      - total_frames = -1 (unknown) -> indeterminate progress
+      - reconnect(): on read failure, retries up to 5 times at 2s intervals,
+        releasing and re-opening the capture; returns the current attempt
+        number so the WorkerThread can emit reconnect_status. After 5 failed
+        attempts it signals exhaustion (Req 11.9).
+    is_stream() returns True so the WorkerThread selects indeterminate-progress
+    and reconnection behavior."""
+
+    MAX_RECONNECT = 5
+    RECONNECT_INTERVAL_SECONDS = 2
+
+    def reconnect(self) -> int:
+        """Attempt one reconnection; return the attempt count (1..5) or raise
+        StreamLostError after MAX_RECONNECT failures."""
+        ...
 
 @dataclass
 class ProcessingConfig:
-    video_path: str
-    output_path: str
+    # Input source (Req 11)
+    source_mode: str            # "file" | "stream"
+    video_path: str             # populated in file mode, "" in stream mode
+    stream_url: str             # populated in stream mode, "" in file mode
+    output_path: str | None     # None when No_Output_Mode is enabled (Req 15)
     confidence: float
     ocr_enabled: bool
     ocr_languages: list[str]
     ocr_interval: int
     plate_model_path: str | None
+    # Detector backend (Req 12) and interval (Req 13)
+    detector_backend: str       # "yolo" | "rekognition"
+    aws_region: str             # used when detector_backend == "rekognition"
+    detect_interval: int        # 1-60
+    no_output: bool             # mirrors output_path is None (Req 15)
 
 class WorkerThread(QThread):
     """Background pipeline execution thread."""
 
     # Signals
     frame_ready = Signal(QImage, int, int)       # annotated frame, frame_idx, active_tracks
-    progress = Signal(int, int, float, int, float)  # current, total, elapsed, active, eta
+    progress = Signal(int, int, float, int, float)  # current, total(-1 if stream), elapsed, active, eta
+    connecting = Signal(str)                      # stream_url, before first frame (Req 11.13)
+    reconnect_status = Signal(int, int)           # attempt, max_attempts (Req 11.8)
     frame_error = Signal(int)                     # cumulative error count
-    finished = Signal(list)                       # list[TrackResult]
+    finished = Signal(list)                       # list[TrackResult] (deduplicated if plate reading on)
     error = Signal(str, int)                      # error message, frame_idx
     log_output = Signal(str)                      # captured stdout/stderr line
 
@@ -276,11 +409,24 @@ class WorkerThread(QThread):
         ...
 
     def run(self) -> None:
-        """Main processing loop — detect, track, OCR, emit signals per frame."""
+        """Main processing loop — select VideoSource (file/stream), detect on
+        detect_interval boundaries (Kalman predict on skipped frames), track,
+        feed plate text into the aggregator, emit per-frame signals.
+        - Stream: emit `connecting` before the first frame, emit indeterminate
+          progress, handle reconnection via StreamVideoSource (emitting
+          reconnect_status), and on exhaustion finish with collected tracks
+          (Req 11.9). Skip VideoWriter unless an output path is provided
+          (Req 11.11).
+        - No_Output_Mode: skip VideoWriter creation entirely (Req 15.4).
+        - On completion, apply _deduplicate_by_plate semantics when plate
+          reading is enabled before emitting `finished` (Req 14)."""
         ...
 
     def request_cancel(self) -> None:
-        """Set cancellation flag (thread-safe via QAtomicInt or threading.Event)."""
+        """Set cancellation flag (thread-safe via threading.Event). Serves both
+        the file 'Cancel' and stream 'Stop' controls; stops within 3s, releases
+        the source, and lets run() finish with the tracks collected so far
+        (Req 3.6, Req 11.10)."""
         ...
 ```
 
@@ -300,6 +446,12 @@ class AppSettings:
     window_height: int = 800
     window_x: int | None = None
     window_y: int | None = None
+    # Extension persisted prefs (Req 12, 13, 15, 11)
+    detector_backend: str = "yolo"   # "yolo" | "rekognition"
+    aws_region: str = "us-east-1"    # 1-64 chars
+    detect_interval: int = 1         # 1-60
+    no_output: bool = False
+    source_mode: str = "file"        # "file" | "stream"
 
 class SettingsManager:
     """Manages application settings persistence."""
@@ -357,14 +509,25 @@ Thin adapter that bridges GUI config to pipeline module constructors without mod
 
 ```python
 class PipelineAdapter:
-    """Adapts GUI ProcessingConfig to pipeline module initialization."""
+    """Adapts GUI ProcessingConfig to pipeline module initialization.
+    Replicates the main.py process_video loop frame-by-frame so the GUI can
+    emit per-frame Qt signals, without importing or modifying process_video."""
 
     def __init__(self, config: ProcessingConfig):
-        self.detector = VehicleDetector(
-            vehicle_model_path="yolov8n.pt",
-            plate_model_path=config.plate_model_path,
-            confidence=config.confidence,
-        )
+        # Req 12: select detector backend. Both expose detect(frame) -> list[dict]
+        # with bbox/plate_bbox/vehicle_conf and optionally plate_text/plate_text_conf.
+        if config.detector_backend == "rekognition":
+            self.detector = RekognitionDetector(
+                region_name=config.aws_region,
+                confidence=config.confidence,
+                use_rekognition_text=config.ocr_enabled,  # plate text only when opted-in (Req 12.8)
+            )
+        else:
+            self.detector = VehicleDetector(
+                vehicle_model_path="yolov8n.pt",
+                plate_model_path=config.plate_model_path,
+                confidence=config.confidence,
+            )
         self.tracker = VehicleTracker(
             iou_threshold=0.3,
             max_lost=60,
@@ -379,10 +542,29 @@ class PipelineAdapter:
         if config.ocr_enabled:
             self.ocr = PlateOCR(languages=config.ocr_languages, gpu=True)
             self.aggregator = PlateTextAggregator(min_readings=3, agreement_threshold=0.4)
+        elif config.detector_backend == "rekognition":
+            # Rekognition reads text for free; aggregate it when plate reading is on.
+            self.aggregator = PlateTextAggregator(min_readings=2, agreement_threshold=0.4)
+        self.detect_interval = config.detect_interval
 
     def process_frame(self, frame: np.ndarray, frame_idx: int) -> tuple[np.ndarray, list, int]:
         """Process a single frame through the full pipeline.
+        Req 13: run detector.detect() only when frame_idx % detect_interval == 0;
+        on skipped frames call tracker.update([], frame_idx, None) so the Kalman
+        filter predicts between detections. When the Rekognition backend returns
+        plate_text, feed it into the aggregator (Req 12, mirrors main.py).
         Returns: (annotated_frame, active_tracks, active_count)"""
+        ...
+
+    def finalize(self, tracks: list) -> list:
+        """Req 14: after processing, apply consensus plate text then merge
+        tracks via plate_utils (plates_are_similar / normalize_plate /
+        pick_best_plate), replicating main._deduplicate_by_plate: tracks with
+        plate text >= 3 chars are grouped by fuzzy similarity; the merged row
+        uses min(first_frame)/max(last_frame), summed hit_count, and the best
+        plate; tracks without plate text or < 3 chars stay as separate rows.
+        Applied only when plate reading is enabled; otherwise returns tracks
+        unchanged (Req 14.3/14.4)."""
         ...
 ```
 
@@ -394,13 +576,19 @@ class PipelineAdapter:
 @dataclass
 class ProcessingConfig:
     """Immutable configuration for a processing session."""
-    video_path: str
-    output_path: str
+    source_mode: str           # "file" | "stream" (Req 11)
+    video_path: str            # set in file mode; "" in stream mode
+    stream_url: str            # set in stream mode; "" in file mode (Req 11)
+    output_path: str | None    # None when No_Output_Mode enabled (Req 15)
     confidence: float          # 0.1 – 1.0
-    ocr_enabled: bool
+    ocr_enabled: bool          # plate text reading opt-in (Req 12.8)
     ocr_languages: list[str]   # e.g. ["en"]
     ocr_interval: int          # 1 – 100
     plate_model_path: str | None
+    detector_backend: str      # "yolo" | "rekognition" (Req 12)
+    aws_region: str            # 1 – 64 chars, default "us-east-1" (Req 12)
+    detect_interval: int       # 1 – 60, passed as detect_interval (Req 13)
+    no_output: bool            # mirrors output_path is None (Req 15)
 ```
 
 ### VideoMetadata
@@ -449,6 +637,11 @@ class AppSettings:
     window_height: int = 800
     window_x: int | None = None
     window_y: int | None = None
+    detector_backend: str = "yolo"   # "yolo" | "rekognition" (Req 12)
+    aws_region: str = "us-east-1"    # 1 – 64 chars (Req 12)
+    detect_interval: int = 1         # 1 – 60 (Req 13)
+    no_output: bool = False          # No_Output_Mode (Req 15)
+    source_mode: str = "file"        # "file" | "stream" (Req 11)
 ```
 
 ### Settings JSON Schema
@@ -463,11 +656,22 @@ class AppSettings:
   "window_width": 1280,
   "window_height": 800,
   "window_x": null,
-  "window_y": null
+  "window_y": null,
+  "detector_backend": "yolo",
+  "aws_region": "us-east-1",
+  "detect_interval": 1,
+  "no_output": false,
+  "source_mode": "file"
 }
 ```
 
 Stored at: `%LOCALAPPDATA%\OpusLaneSight\settings.json`
+
+Validation on load (Req 5.3 extended): `detector_backend` must be one of
+`{"yolo", "rekognition"}` (else `"yolo"`); `aws_region` must be a 1–64 char
+non-empty string (else `"us-east-1"`); `detect_interval` is clamped to 1–60
+and non-integers fall back to 1; `no_output` must be boolean (else `false`);
+`source_mode` must be one of `{"file", "stream"}` (else `"file"`).
 
 
 ## Correctness Properties
@@ -534,6 +738,66 @@ Stored at: `%LOCALAPPDATA%\OpusLaneSight\settings.json`
 
 **Validates: Requirements 9.6**
 
+### Property 11: Stream URL scheme validation
+
+*For any* string `url`, the stream URL validator SHALL accept it if and only if (after trimming surrounding whitespace) it is non-empty and begins, case-insensitively, with one of the schemes `rtsp://`, `rtmp://`, `http://`, or `https://`, and its length does not exceed 2048 characters. Whitespace-only and unsupported-scheme strings SHALL be rejected.
+
+**Validates: Requirements 11.2, 11.5, 11.12**
+
+### Property 12: ProcessingConfig source/parameter mapping
+
+*For any* valid InputPanel control state, `build_config()` SHALL map the selections faithfully: in `"stream"` mode `stream_url` equals the entered URL and `video_path` equals `""`; in `"file"` mode `video_path` is the selected path and `stream_url` equals `""`; the detector selection maps to exactly `"yolo"` or `"rekognition"`; `aws_region` is carried through unchanged; and `detect_interval` is passed as an integer within `[1, 60]`.
+
+**Validates: Requirements 11.4, 12.4, 13.2**
+
+### Property 13: Stream reconnection attempt counting
+
+*For any* number of consecutive stream-read failures `k`, the reconnection counter SHALL report `min(k, 5)` as the current attempt number, and exhaustion (stream lost) SHALL be signaled if and only if `k > 5`, at which point processing finishes with the tracks collected before the interruption.
+
+**Validates: Requirements 11.8, 11.9**
+
+### Property 14: AWS region validation
+
+*For any* string `region`, the AWS region validator SHALL accept it if and only if, after trimming surrounding whitespace, it is non-empty and its length is within `[1, 64]`. Empty and whitespace-only strings SHALL be rejected.
+
+**Validates: Requirements 12.5**
+
+### Property 15: Detection interval clamping
+
+*For any* numeric value `v`, clamping to the valid detection-interval range SHALL produce `max(1, min(60, round(v)))`, which is always an integer within `[1, 60]` (equal to 1 when `v < 1` and 60 when `v > 60`).
+
+**Validates: Requirements 13.4, 13.5**
+
+### Property 16: Detection interval non-integer rejection
+
+*For any* manual text entry, the detection-interval parser SHALL reject values that do not denote an integer and SHALL preserve the most recent valid integer value; it SHALL accept a value if and only if the entry denotes an integer, which is then clamped to `[1, 60]`.
+
+**Validates: Requirements 13.6**
+
+### Property 17: Plate deduplication merge invariants
+
+*For any* list of tracks with plate text reading enabled, the deduplication SHALL place two tracks in the same merged row if and only if their plate texts are equal or are matched after OCR-confusable normalization (O/0, I/1, S/5, B/8); each merged row's `first_frame` SHALL equal the minimum `first_frame` of its group, its `last_frame` SHALL equal the maximum `last_frame`, its `hit_count` SHALL equal the sum of the group's hit counts, and its plate text SHALL equal the best plate selected by `pick_best_plate`. Tracks whose plate text is absent or shorter than 3 characters SHALL each remain a separate, unmerged row.
+
+**Validates: Requirements 14.1, 14.2, 14.3**
+
+### Property 18: Deduplication identity-when-disabled and idempotence
+
+*For any* list of tracks, when plate text reading is disabled the deduplication SHALL return rows equal in count and content to the input tracks (no merging); and when enabled the deduplication SHALL be idempotent such that applying it twice yields the same result as applying it once (`dedup(dedup(tracks)) == dedup(tracks)`). Summary statistics SHALL be computed from the deduplicated row set.
+
+**Validates: Requirements 14.4, 14.5**
+
+### Property 19: No-output mode config mapping
+
+*For any* InputPanel control state, when No_Output_Mode is enabled `build_config().output_path` SHALL be `None` (and `no_output` is `True`); when disabled `output_path` SHALL be a non-`None` path string.
+
+**Validates: Requirements 15.4**
+
+### Property 20: Extended settings round-trip persistence
+
+*For any* valid `AppSettings` instance (including `detector_backend` in `{"yolo","rekognition"}`, `aws_region` a 1–64 char string, `detect_interval` in `[1, 60]`, `no_output` boolean, and `source_mode` in `{"file","stream"}`), serializing to JSON and deserializing SHALL produce an `AppSettings` instance with identical field values; and invalid/out-of-range values for these new fields SHALL fall back to their documented defaults.
+
+**Validates: Requirements 5.3, 12.2, 15.1, 15.6**
+
 ## Error Handling
 
 ### Error Categories and Strategies
@@ -550,6 +814,10 @@ Stored at: `%LOCALAPPDATA%\OpusLaneSight\settings.json`
 | **Settings file corrupt** | Invalid JSON or out-of-range values | Fallback to defaults, overwrite file | Silent recovery (no user disruption) |
 | **Settings file not writable** | Permissions issue | In-memory operation | Non-blocking warning toast |
 | **Worker cancellation** | User clicks Cancel or closes window | `threading.Event` flag checked per frame | Cancellation message, return to InputPanel |
+| **Stream connect failure** | Stream URL cannot be opened at all | `StreamVideoSource.open()` returns False | Error message, return to InputPanel |
+| **Stream reconnection exhaustion** | Stream lost, >5 reconnect attempts at 2s | `StreamVideoSource.reconnect()` raises `StreamLostError` | "Stream lost" message; switch to ResultsView with tracks collected so far (Req 11.9) |
+| **AWS credentials error** | Missing/invalid AWS credentials on Rekognition call | Catch boto3 `NoCredentialsError`/`ClientError` (`UnrecognizedClient`, `InvalidSignature`) in WorkerThread | Error dialog identifying an AWS credentials error; retain selections; return to InputPanel (Req 12.6) |
+| **AWS region/service/network error** | Region, throttling, or service exception from Rekognition | Catch boto3 `ClientError`/`EndpointConnectionError`/`BotoCoreError` | Error dialog describing the AWS API failure; retain selections; return to InputPanel (Req 12.7) |
 
 ### Error Signal Flow
 
@@ -621,15 +889,25 @@ The testing strategy combines:
 | 8: Confidence clamping | `clamp_confidence(value)` | `st.floats(-100, 100)` |
 | 9: Frame error counter | `count_errors(outcomes)` | `st.lists(st.booleans())` |
 | 10: Extension validation | `is_valid_video_extension(path)` | `st.text()` + known extensions |
+| 11: Stream URL scheme validation | `is_valid_stream_url(url)` | `st.text()` + `st.sampled_from(schemes)` prefixes |
+| 12: Config source/param mapping | `InputPanel.build_config()` | `st.builds(control_state, ...)` (modes, backends, regions, intervals) |
+| 13: Reconnection attempt counting | `StreamVideoSource.reconnect()` state | `st.integers(0, 12)` failure runs (cap mocked capture) |
+| 14: AWS region validation | `is_valid_aws_region(region)` | `st.text()` incl. whitespace + 0–80 char lengths |
+| 15: Detect interval clamping | `clamp_detect_interval(v)` | `st.floats(-100, 200)` / `st.integers(-100, 200)` |
+| 16: Detect interval non-integer rejection | `parse_detect_interval(text, last)` | `st.text()` + `st.integers()` |
+| 17: Dedup merge invariants | `deduplicate_by_plate(tracks)` (uses `plate_utils`) | `st.lists(st.builds(TrackResult, plate_text=...))` |
+| 18: Dedup identity/idempotence | `deduplicate_by_plate(tracks, enabled)` | `st.lists(st.builds(TrackResult, ...))` |
+| 19: No-output config mapping | `InputPanel.build_config()` | `st.builds(control_state, no_output=st.booleans())` |
+| 20: Extended settings round-trip | `SettingsManager.save()` → `load()` | `st.builds(AppSettings, ...)` incl. new fields |
 
 ### Unit Test Targets
 
 | Component | Test Focus |
 |---|---|
-| `InputPanel` | Widget state (button enabled/disabled), OCR controls visibility |
-| `ProcessingView` | Progress bar value updates, stats label formatting |
-| `ResultsView` | Table column count, column visibility with OCR on/off, empty state |
-| `SettingsManager` | Directory creation, default values, file corruption recovery |
+| `InputPanel` | Widget state (button enabled/disabled), OCR controls visibility, source-mode selector default + stream URL field visibility, file controls disabled in stream mode, detector-backend default + AWS region field visibility, detect-interval bounds/default, Rekognition 5–10 recommendation visible, no-output toggle disabling the output path selector, privacy note under Rekognition + plate reading |
+| `ProcessingView` | Progress bar value updates (determinate), indeterminate progress when `total == -1`, connecting status text shows URL, reconnection status text, Stop button label in stream mode, stats label formatting |
+| `ResultsView` | Table column count, column visibility with OCR on/off, empty state, output path/open-folder omitted with "no output video written" text when `output_path is None` |
+| `SettingsManager` | Directory creation, default values (incl. new fields), file corruption recovery, new-field range fallbacks |
 | `BrandTheme` | Stylesheet contains expected color hex values |
 | `MainWindow` | View switching, window title format, drag-and-drop acceptance |
 
@@ -641,6 +919,13 @@ The testing strategy combines:
 | Cancellation flow | Start worker, cancel after N frames, verify thread stops |
 | Error propagation | Inject exception in mocked detector, verify error signal reaches UI |
 | Settings persistence | Write settings, relaunch manager, verify values match |
+| Stream processing + reconnection | Fake `StreamVideoSource` that yields N frames then fails; verify indeterminate progress, reconnect_status emissions, and finish-with-collected-tracks on exhaustion (Req 11.7–11.9) |
+| Stream Stop control | Start stream worker, request stop, verify stop within 3s and switch to ResultsView (Req 11.10) |
+| Rekognition backend selection | Mock `RekognitionDetector` (patch `boto3.client`) returning canned detections; verify the adapter selects it for `detector_backend="rekognition"` and threads plate_text into the aggregator |
+| AWS error handling | Mock `boto3` Rekognition client to raise `NoCredentialsError` and a service `ClientError`; verify credentials vs service error classification and return to InputPanel (Req 12.6/12.7) |
+| Recording for stream | Provide an output path in stream mode; verify `cv2.VideoWriter` is created (mocked) (Req 11.11) |
+
+**Rekognition / boto3 mocking:** Rekognition integration tests MUST NOT call AWS. Patch `boto3.client("rekognition")` (e.g., via `unittest.mock` or `botocore.stub.Stubber`) so `RekognitionDetector.detect()` returns canned label/text responses and errors are injected deterministically. This keeps tests offline, fast, and credential-free.
 
 ### Test Execution
 
@@ -657,8 +942,18 @@ pytest tests/test_gui_properties.py --hypothesis-show-statistics
 
 ### Coverage Goals
 
-- Property tests cover all 10 correctness properties
+- Property tests cover all 20 correctness properties
 - Unit tests cover widget construction and state transitions
-- Integration tests cover the worker→signal→view pipeline
+- Integration tests cover the worker→signal→view pipeline, stream reconnection, and the Rekognition backend (boto3 mocked)
 - No tests require a running display server (use `QApplication` with `offscreen` platform plugin via `QT_QPA_PLATFORM=offscreen`)
+
+## Dependencies
+
+The GUI introduces no new dependency for itself beyond PySide6; however, selecting the AWS Rekognition detector backend (Requirement 12) exercises the existing `detector_rekognition.py`, which depends on **`boto3`** (the AWS SDK for Python).
+
+| Package | Role | License | Notes |
+|---|---|---|---|
+| `boto3` | AWS Rekognition API client used by `RekognitionDetector` | Apache-2.0 (permissive) | New runtime dependency; required only when the Rekognition backend is selected. Pin in `requirements.txt`. Tests mock it (no live AWS calls). |
+
+`boto3` is imported by the unmodified pipeline module `detector_rekognition.py`; the GUI does not call AWS directly. Credentials are resolved by `boto3` from the standard provider chain (environment, shared config, instance profile) and are never collected, stored, or logged by the GUI.
 

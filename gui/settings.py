@@ -114,6 +114,11 @@ class SettingsManager:
         - window dimensions: ensure positive integers
         - window_x / window_y: int or None
         - output_path: ensure string
+        - detector_backend: one of {"yolo", "rekognition"}, default "yolo"
+        - aws_region: non-empty string 1-64 chars, default "us-east-1"
+        - detect_interval: clamp to [1, 60], non-int falls back to 1
+        - no_output: coerce to bool
+        - source_mode: one of {"file", "stream"}, default "file"
         """
         # confidence
         try:
@@ -174,6 +179,35 @@ class SettingsManager:
             except (TypeError, ValueError):
                 window_y = None
 
+        # detector_backend
+        detector_backend = data.get("detector_backend", "yolo")
+        if detector_backend not in ("yolo", "rekognition"):
+            detector_backend = "yolo"
+
+        # aws_region
+        aws_region = data.get("aws_region", "us-east-1")
+        if (
+            not isinstance(aws_region, str)
+            or not (1 <= len(aws_region) <= 64)
+            or not aws_region.strip()
+        ):
+            aws_region = "us-east-1"
+
+        # detect_interval
+        raw_interval = data.get("detect_interval", 1)
+        if isinstance(raw_interval, bool) or not isinstance(raw_interval, int):
+            detect_interval = 1
+        else:
+            detect_interval = max(1, min(60, raw_interval))
+
+        # no_output
+        no_output = bool(data.get("no_output", False))
+
+        # source_mode
+        source_mode = data.get("source_mode", "file")
+        if source_mode not in ("file", "stream"):
+            source_mode = "file"
+
         return AppSettings(
             confidence=confidence,
             ocr_enabled=ocr_enabled,
@@ -184,6 +218,11 @@ class SettingsManager:
             window_height=window_height,
             window_x=window_x,
             window_y=window_y,
+            detector_backend=detector_backend,
+            aws_region=aws_region,
+            detect_interval=detect_interval,
+            no_output=no_output,
+            source_mode=source_mode,
         )
 
     def _schedule_save(self) -> None:

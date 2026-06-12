@@ -8,6 +8,8 @@ clicks "Cancel".
 Slot signatures mirror the WorkerThread signals exactly:
     - frame_ready(QImage, int, int)  -> on_frame_ready
     - progress(int, int, float, int, float) -> on_progress
+    - connecting(str) -> on_connecting
+    - reconnect_status(int, int) -> on_reconnect_status
     - frame_error(int) -> on_frame_error
 """
 
@@ -58,6 +60,7 @@ class ProcessingView(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._error_count = 0
+        self._stream_mode = False
         self._build_ui()
         self._reset_stats()
 
@@ -103,6 +106,14 @@ class ProcessingView(QWidget):
         self.progress_bar.setFormat("%p%")
         root.addWidget(self.progress_bar)
 
+        # Stream status line (connecting / reconnecting messages). Hidden in
+        # file mode where the percentage progress bar is self-explanatory.
+        self.status_label = QLabel("")
+        self.status_label.setProperty("role", "body")
+        self.status_label.setProperty("secondary", True)
+        self.status_label.setVisible(False)
+        root.addWidget(self.status_label)
+
         # Statistics panel
         stats_card = QFrame()
         stats_card.setProperty("card", True)
@@ -111,12 +122,16 @@ class ProcessingView(QWidget):
         stats_grid.setHorizontalSpacing(32)
         stats_grid.setVerticalSpacing(8)
 
-        self.current_frame_value = self._add_stat(stats_grid, 0, 0, "Current frame")
-        self.total_frames_value = self._add_stat(stats_grid, 0, 1, "Total frames")
-        self.active_count_value = self._add_stat(stats_grid, 0, 2, "Active vehicles")
-        self.elapsed_value = self._add_stat(stats_grid, 1, 0, "Elapsed time")
-        self.eta_value = self._add_stat(stats_grid, 1, 1, "Estimated remaining")
-        self.error_value = self._add_stat(stats_grid, 1, 2, "Skipped frames")
+        self.current_frame_value = self._add_stat(stats_grid, 0, 0, "Current frame")[1]
+        self.total_frames_caption, self.total_frames_value = self._add_stat(
+            stats_grid, 0, 1, "Total frames"
+        )
+        self.active_count_value = self._add_stat(stats_grid, 0, 2, "Active vehicles")[1]
+        self.elapsed_value = self._add_stat(stats_grid, 1, 0, "Elapsed time")[1]
+        self.eta_caption, self.eta_value = self._add_stat(
+            stats_grid, 1, 1, "Estimated remaining"
+        )
+        self.error_value = self._add_stat(stats_grid, 1, 2, "Skipped frames")[1]
 
         root.addWidget(stats_card)
 
@@ -130,8 +145,8 @@ class ProcessingView(QWidget):
 
     def _add_stat(
         self, grid: QGridLayout, row: int, col: int, label_text: str
-    ) -> QLabel:
-        """Create a label/value pair in *grid* and return the value label."""
+    ) -> tuple[QLabel, QLabel]:
+        """Create a label/value pair in *grid* and return ``(caption, value)``."""
         container = QVBoxLayout()
         container.setSpacing(2)
 
@@ -146,20 +161,53 @@ class ProcessingView(QWidget):
         wrapper = QWidget()
         wrapper.setLayout(container)
         grid.addWidget(wrapper, row, col)
-        return value
+        return caption, value
 
     def _reset_stats(self) -> None:
         """Reset all statistics and the preview to their initial state."""
         self._error_count = 0
-        self.progress_bar.setValue(0)
+        if self._stream_mode:
+            self.progress_bar.setRange(0, 0)
+        else:
+            self.progress_bar.setRange(0, 100)
+            self.progress_bar.setValue(0)
         self.current_frame_value.setText("0")
-        self.total_frames_value.setText("0")
+        self.total_frames_value.setText("Live" if self._stream_mode else "0")
         self.active_count_value.setText("0")
         self.elapsed_value.setText("00:00")
-        self.eta_value.setText("--:--")
+        self.eta_value.setText("0.0" if self._stream_mode else "--:--")
         self.error_value.setText("0")
+        self.status_label.setText("")
+        self.status_label.setVisible(self._stream_mode)
         self.frame_label.setText("Waiting for first frame…")
         self.frame_label.setPixmap(QPixmap())
+
+    def set_stream_mode(self, enabled: bool) -> None:
+        """Configure the view for live stream (``True``) or file (``False``) mode.
+
+        In stream mode the total frame count is unknown, so the progress bar
+        switches to indeterminate, the cancel control is labelled "Stop", and
+        the "Total frames" / "Estimated remaining" statistics are repurposed to
+        show the stream state and the effective frames-per-second (Req 11.6,
+        11.7, 11.10).
+        """
+        self._stream_mode = bool(enabled)
+        if self._stream_mode:
+            self.cancel_button.setText("Stop")
+            self.total_frames_caption.setText("Stream")
+            self.eta_caption.setText("Effective FPS")
+            self.progress_bar.setRange(0, 0)
+            self.progress_bar.setFormat("")
+            self.status_label.setVisible(True)
+        else:
+            self.cancel_button.setText("Cancel")
+            self.total_frames_caption.setText("Total frames")
+            self.eta_caption.setText("Estimated remaining")
+            self.progress_bar.setRange(0, 100)
+            self.progress_bar.setFormat("%p%")
+            self.progress_bar.setValue(0)
+            self.status_label.setVisible(False)
+        self._reset_stats()
 
     def reset(self) -> None:
         """Public reset hook used when (re)starting a processing session."""
@@ -192,13 +240,60 @@ class ProcessingView(QWidget):
         active_count: int,
         eta: float,
     ) -> None:
-        """Update progress bar and statistics labels."""
+        """Update progress bar and statistics labels.
+
+        A *total* of ``-1`` denotes a live stream with an unknown frame count
+        (Req 11.6): the progress bar switches to an indeterminate indicator and
+        the statistics show elapsed time, active vehicle count, and the
+        effective frames-per-second instead of a percentage and ETA (Req 11.7).
+        """
+        if total == -1:
+            if not self._stream_mode:
+                self.set_stream_mode(True)
+            # Indeterminate progress: unknown total frame count.
+            if self.progress_bar.maximum() != 0:
+                self.progress_bar.setRange(0, 0)
+            self.current_frame_value.setText(str(current))
+            self.active_count_value.setText(str(active_count))
+            self.elapsed_value.setText(format_duration(elapsed))
+            self.eta_value.setText(self._format_fps(current, elapsed))
+            # Frames are flowing: clear any connecting/reconnecting message.
+            self.status_label.setText("Processing live stream.")
+            return
+
         self.progress_bar.setValue(int(round(compute_progress(current, total))))
         self.current_frame_value.setText(str(current))
         self.total_frames_value.setText(str(total))
         self.active_count_value.setText(str(active_count))
         self.elapsed_value.setText(format_duration(elapsed))
         self.eta_value.setText(format_duration(eta))
+
+    @staticmethod
+    def _format_fps(current: int, elapsed: float) -> str:
+        """Return the effective FPS (frames processed / elapsed) as ``"x.y"``."""
+        try:
+            seconds = float(elapsed)
+        except (TypeError, ValueError):
+            seconds = 0.0
+        if seconds <= 0.0:
+            return "0.0"
+        return f"{current / seconds:.1f}"
+
+    @Slot(str)
+    def on_connecting(self, stream_url: str) -> None:
+        """Show a connecting status message before the first frame (Req 11.13)."""
+        self.set_stream_mode(True)
+        self.status_label.setText(f"Connecting to {stream_url}…")
+        self.status_label.setVisible(True)
+        self.frame_label.setText("Connecting to live stream…")
+
+    @Slot(int, int)
+    def on_reconnect_status(self, attempt: int, max_attempts: int) -> None:
+        """Show the current reconnection attempt out of the maximum (Req 11.8)."""
+        self.status_label.setText(
+            f"Reconnecting ({attempt}/{max_attempts})…"
+        )
+        self.status_label.setVisible(True)
 
     @Slot(int)
     def on_frame_error(self, error_count: int) -> None:

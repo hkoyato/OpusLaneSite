@@ -139,6 +139,48 @@ def resolve_model_str(
     return str(resolved) if resolved is not None else filename
 
 
+def ensure_model(
+    filename: str = DEFAULT_VEHICLE_MODEL,
+    override: str | None = None,
+) -> Path | None:
+    """Return a path to *filename*, downloading it if it is not present.
+
+    The model is first looked up via :func:`resolve_model`. When it cannot be
+    found locally, Ultralytics is asked to fetch the official weights into
+    ``assets/models/`` (created if necessary). Returns the resolved path, or
+    ``None`` if the model is unavailable and the download fails (e.g. offline).
+
+    The download is performed by Ultralytics' own asset downloader, which
+    resolves the correct release for the installed version. Any failure is
+    swallowed so callers can fall back to their existing not-found handling.
+    """
+    existing = resolve_model(filename, override)
+    if existing is not None:
+        return existing
+
+    # Only auto-download the recognised default model name; never attempt to
+    # fetch arbitrary user-supplied filenames from the network.
+    if Path(filename).name != DEFAULT_VEHICLE_MODEL:
+        return None
+
+    target_dir = models_dir()
+    target = target_dir / filename
+    try:
+        target_dir.mkdir(parents=True, exist_ok=True)
+        from ultralytics.utils.downloads import attempt_download_asset
+
+        downloaded = attempt_download_asset(str(target))
+        result = Path(downloaded) if downloaded else target
+        if result.is_file():
+            return result
+    except Exception:
+        # Network/permission/import errors fall through to the not-found path.
+        pass
+
+    # Re-check in case the download landed via resolution fallbacks.
+    return resolve_model(filename, override)
+
+
 def resolve_asset(*parts: str) -> Path | None:
     """Return the first existing path for an asset under ``assets/``.
 
