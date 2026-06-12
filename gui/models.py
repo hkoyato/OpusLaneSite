@@ -4,6 +4,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from gui.station_validation import (
+    DEFAULT_STATION_IDENTIFIER,
+    effective_display_name as _effective_display_name,
+)
+
 
 @dataclass
 class ProcessingConfig:
@@ -24,6 +29,11 @@ class ProcessingConfig:
     aws_region: str = "us-east-1"  # used when detector_backend == "rekognition"
     detect_interval: int = 1  # 1 – 60
     no_output: bool = False  # mirrors output_path is None (Req 15)
+    # Operator-configured number of active inspection lanes. The vision
+    # pipeline cannot detect lanes from a single camera, so this is a manual
+    # station override (product overview §14) that feeds the deterministic
+    # wait-time formula instead of a fabricated constant.
+    active_lanes: int = 1  # 1 – 99
 
 
 @dataclass
@@ -53,6 +63,30 @@ class TrackResult:
     wait_time: float | None  # leave_time - enter_time or None
 
 
+@dataclass(frozen=True)
+class StationConfig:
+    """Immutable active station configuration (value object).
+
+    frozen=True guarantees a config handed to a record producer cannot be
+    mutated after the fact, reinforcing the capture-by-value record contract
+    (Req 5.5).
+    """
+
+    identifier: str  # Station_Identifier, validated 1-64 [a-z0-9_-]
+    display_name: str  # Station_Display_Name, 0-128 chars ("" allowed)
+
+    @property
+    def effective_display_name(self) -> str:
+        """Display name when non-whitespace, else the identifier (Req 2.8)."""
+        return _effective_display_name(self.identifier, self.display_name)
+
+    @classmethod
+    def default(cls) -> "StationConfig":
+        """Default config: identifier and display name both the default
+        identifier (Req 3.3)."""
+        return cls(DEFAULT_STATION_IDENTIFIER, DEFAULT_STATION_IDENTIFIER)
+
+
 @dataclass
 class AppSettings:
     """Persisted application settings."""
@@ -72,3 +106,8 @@ class AppSettings:
     detect_interval: int = 1  # 1 – 60
     no_output: bool = False
     source_mode: str = "file"  # "file" | "stream"
+    # Operator-configured active inspection lanes (manual station override).
+    active_lanes: int = 1  # 1 – 99
+    # Station identity (station-identification spec, Req 3)
+    station_id: str = "demo_station_01"  # Station_Identifier
+    station_display_name: str = "demo_station_01"  # Station_Display_Name

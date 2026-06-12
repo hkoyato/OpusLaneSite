@@ -279,3 +279,50 @@ def test_output_path_shown_when_output_written(view):
     assert view._open_folder_btn.isHidden() is False
     assert view._open_folder_btn.isEnabled() is True
     assert view._no_output_label.isHidden() is True
+
+
+# ============================================================================
+# Station display name in the results header
+#
+# Validates: Requirement 6.4
+#
+# set_station_display_name() shows the active Station_Display_Name in the
+# results header (_station_header_label). An empty/whitespace value hides the
+# label (default hidden state); a non-empty value is shown via the shared
+# header_label() helper, truncating to 40 chars + "..." with the full value as
+# the tooltip. The view is never realized on screen, so visibility is asserted
+# via isVisibleTo(view) / the explicit isHidden() flag rather than isVisible().
+# ============================================================================
+
+from gui.station_validation import HEADER_DISPLAY_MAX_LEN
+
+
+def test_station_display_name_shown_in_header(view):
+    """A display name is shown in the results header label. (Req 6.4)"""
+    view.set_station_display_name("Demo Inspection Station")
+
+    assert view._station_header_label.isVisibleTo(view) is True
+    assert view._station_header_label.isHidden() is False
+    assert view._station_header_label.text() == "Demo Inspection Station"
+
+
+def test_empty_station_display_name_hides_header(view):
+    """An empty/whitespace display name hides the header label. (Req 6.4)"""
+    # First show a value, then confirm a whitespace-only value hides it again.
+    view.set_station_display_name("Demo Inspection Station")
+    view.set_station_display_name("   ")
+
+    assert view._station_header_label.text() == ""
+    assert view._station_header_label.isVisibleTo(view) is False
+    assert view._station_header_label.isHidden() is True
+
+
+def test_long_station_display_name_truncated_with_full_tooltip(view):
+    """A display name > 40 chars is truncated to 40 chars + '...' with the full
+    value exposed as the tooltip. (Req 6.4, via header_label helper)"""
+    long_name = "x" * (HEADER_DISPLAY_MAX_LEN + 15)  # 55 chars, > 40
+    view.set_station_display_name(long_name)
+
+    assert view._station_header_label.isVisibleTo(view) is True
+    assert view._station_header_label.text() == long_name[:HEADER_DISPLAY_MAX_LEN] + "..."
+    assert view._station_header_label.toolTip() == long_name

@@ -29,9 +29,23 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from gui.metrics import (
+    STATUS_ATTENTION,
+    STATUS_MODERATE,
+    STATUS_NORMAL,
+    compute_station_metrics,
+)
 from gui.models import TrackResult
+from gui.station_validation import header_label
 from gui.theme import BrandTheme
 from gui.utils import compute_summary, sort_results_default
+
+# Map metric status keys to the Opus status-color system (ui_guidelines §5).
+_STATUS_COLORS = {
+    STATUS_NORMAL: BrandTheme.GREEN,
+    STATUS_MODERATE: BrandTheme.BLUE,
+    STATUS_ATTENTION: BrandTheme.ORANGE,
+}
 
 # Column indices for the vehicle table.
 _COL_VEHICLE_ID = 0
@@ -83,6 +97,25 @@ class ResultsView(QWidget):
         self._output_path: str = ""
         self._build_ui()
 
+    def set_station_display_name(self, display_name: str) -> None:
+        """Show the active Station_Display_Name in the results header (Req 6.4).
+
+        Optional setter wired by the controller integration (task 9.1) so the
+        view stays independent of ``MainWindow``. An empty/whitespace-only value
+        hides the label; otherwise the (truncated) display name is shown with
+        the full value available on hover.
+        """
+        text = display_name.strip()
+        if not text:
+            self._station_header_label.setText("")
+            self._station_header_label.setToolTip("")
+            self._station_header_label.setVisible(False)
+            return
+        shown, full = header_label(text)
+        self._station_header_label.setText(shown)
+        self._station_header_label.setToolTip(full if full is not None else text)
+        self._station_header_label.setVisible(True)
+
     # ------------------------------------------------------------------
     # UI construction
     # ------------------------------------------------------------------
@@ -95,7 +128,24 @@ class ResultsView(QWidget):
         # Section title
         title = QLabel("Results")
         title.setProperty("role", "section-title")
-        root.addWidget(title)
+
+        # Optional active Station_Display_Name shown in the results header
+        # (Req 6.4). Hidden until set via set_station_display_name().
+        self._station_header_label = QLabel()
+        self._station_header_label.setProperty("role", "card-title")
+        self._station_header_label.setProperty("secondary", True)
+        self._station_header_label.setVisible(False)
+
+        title_row = QHBoxLayout()
+        title_row.addWidget(title)
+        title_row.addStretch(1)
+        title_row.addWidget(self._station_header_label)
+        root.addLayout(title_row)
+
+        # Station intelligence: public wait estimate + status banner and the
+        # operational metrics derived from the wait-time formula.
+        self._station_value_labels: dict[str, QLabel] = {}
+        root.addLayout(self._build_station_cards())
 
         # Summary metric cards
         self._summary_value_labels: dict[str, QLabel] = {}
@@ -126,6 +176,47 @@ class ResultsView(QWidget):
         new_session_btn.clicked.connect(self.new_session_requested.emit)
         button_row.addWidget(new_session_btn)
         root.addLayout(button_row)
+
+    def _build_station_cards(self) -> QGridLayout:
+        """Build the station-intelligence card row.
+
+        Surfaces the deterministic public wait-time estimate (the headline
+        operational number), a colour-coded status, and the metrics that feed
+        the formula: vehicles in queue, average inspection time, active lanes,
+        and throughput. These are computed by ``gui.metrics`` from the tracked
+        results.
+        """
+        grid = QGridLayout()
+        grid.setSpacing(16)
+        cards = [
+            ("estimated_wait", "Estimated public wait", "min"),
+            ("status", "Queue status", ""),
+            ("vehicles_in_queue", "Vehicles in queue", ""),
+            ("avg_inspection", "Avg inspection", "min"),
+            ("active_lanes", "Active lanes", ""),
+            ("throughput", "Throughput / hr", ""),
+        ]
+        for col, (key, label_text, _unit) in enumerate(cards):
+            card = QFrame()
+            card.setProperty("card", True)
+            card.setStyleSheet(BrandTheme.card_style())
+            card_layout = QVBoxLayout(card)
+            card_layout.setSpacing(8)
+
+            label = QLabel(label_text)
+            label.setProperty("role", "card-title")
+            label.setProperty("secondary", True)
+
+            value = QLabel(_DASH)
+            value.setProperty("role", "metric")
+            value.setWordWrap(True)
+
+            card_layout.addWidget(label)
+            card_layout.addWidget(value)
+            self._station_value_labels[key] = value
+            grid.addWidget(card, 0, col)
+            grid.setColumnStretch(col, 1)
+        return grid
 
     def _build_summary_cards(self) -> QGridLayout:
         grid = QGridLayout()
@@ -227,11 +318,12 @@ class ResultsView(QWidget):
     def display_results(
         self,
         results: list[TrackResult],
-        fps: float,  # noqa: ARG002 - times are precomputed on TrackResult
+        fps: float,
         ocr_enabled: bool,
         output_path: str | None,
         skipped_frames: int,
         total_frames: int,
+        active_lanes: int = 1,
     ) -> None:
         """Populate the table and summary cards from *results*.
 
@@ -282,6 +374,15 @@ class ResultsView(QWidget):
         # Summary cards.
         self._update_summary(compute_summary(results))
 
+        # Station intelligence cards (deterministic wait-time formula).
+        # Ground throughput in the real processed window (frame count / fps)
+        # when known; fall back to the metrics module's track-time inference
+        # for streams where the total frame count is unknown.
+        observed_duration = (
+            total_frames / fps if fps > 0 and total_frames > 0 else None
+        )
+        self._update_station_metrics(results, active_lanes, observed_duration)
+
         # Empty state vs. table.
         if not results:
             self._table.setRowCount(0)
@@ -308,6 +409,54 @@ class ResultsView(QWidget):
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _update_station_metrics(
+        self,
+        results: list[TrackResult],
+        active_lanes: int = 1,
+        observed_duration_seconds: float | None = None,
+    ) -> None:
+        """Compute and display the station-intelligence cards.
+
+        Uses ``gui.metrics.compute_station_metrics`` so the public wait-time
+        estimate shown here is the same transparent, deterministic value the
+        public card and Bedrock summary will consume. ``active_lanes`` is the
+        operator-configured manual override (the vision pipeline cannot detect
+        lane count from a single camera) and ``observed_duration_seconds`` is
+        the real processed window so throughput is grounded in measured data.
+        """
+        metrics = compute_station_metrics(
+            results,
+            active_lanes=active_lanes,
+            observed_duration_seconds=observed_duration_seconds,
+        )
+
+        wait = metrics.estimated_public_wait_minutes
+        self._station_value_labels["estimated_wait"].setText(
+            _DASH if wait is None else f"{wait} min"
+        )
+
+        status_label = self._station_value_labels["status"]
+        status_label.setText(metrics.status_label)
+        color = _STATUS_COLORS.get(metrics.status, BrandTheme.GRAY)
+        status_label.setStyleSheet(f"color: {color}; font-weight: 700;")
+
+        self._station_value_labels["vehicles_in_queue"].setText(
+            str(metrics.vehicles_in_queue)
+        )
+
+        avg = metrics.average_inspection_minutes
+        self._station_value_labels["avg_inspection"].setText(
+            _DASH if avg is None else f"{avg:.1f} min"
+        )
+
+        self._station_value_labels["active_lanes"].setText(
+            str(metrics.active_lanes)
+        )
+
+        self._station_value_labels["throughput"].setText(
+            f"{metrics.throughput_per_hour:.0f}"
+        )
 
     def _update_summary(self, summary: dict) -> None:
         self._summary_value_labels["total_vehicles"].setText(

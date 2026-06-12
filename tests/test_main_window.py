@@ -39,6 +39,9 @@ class FakeSettings:
     def __init__(self, **overrides: object) -> None:
         self._settings = AppSettings(**overrides)
         self.updates: list[dict] = []
+        # StationController (wired into MainWindow) reads this flag at launch
+        # to decide whether persistence is available.
+        self.read_only = False
 
     def get(self) -> AppSettings:
         return self._settings
@@ -338,3 +341,54 @@ def test_sidebar_holds_at_least_six_nav_entries(window):
     supports more than 6 entries without scrolling.
     """
     assert window.nav.count() >= 3
+
+
+# ---------------------------------------------------------------------------
+# Header station rendering (Requirements 4.1, 4.2, 4.4, 4.5)
+# ---------------------------------------------------------------------------
+
+
+from gui.models import StationConfig  # noqa: E402
+from gui.station_validation import HEADER_DISPLAY_MAX_LEN  # noqa: E402
+
+
+def test_station_display_name_rendered_on_every_view(window):
+    """The active display name persists in the header across all views (Req 4.1).
+
+    The header is persistent, so once the active Station_Display_Name is set it
+    remains visible as the operator switches between the input, processing,
+    results, and station views.
+    """
+    window.station_controller.set_active(
+        StationConfig("demo_station_01", "Demo Inspection Station")
+    )
+
+    for view_name in ("input", "processing", "results", "station"):
+        window.switch_view(view_name)
+        assert window._station_label.text() == "Demo Inspection Station"
+
+
+def test_header_updates_on_station_changed(window):
+    """Setting a new active config updates the header label (Req 4.4)."""
+    window.station_controller.set_active(StationConfig("new_id", "New Display"))
+
+    assert window._station_label.text() == "New Display"
+
+
+def test_header_shows_placeholder_when_no_active_config(window):
+    """An empty effective display name renders the placeholder (Req 4.5)."""
+    window._update_station_label("")
+
+    assert window._station_label.text() == "No station selected"
+    assert window._station_label.toolTip() == ""
+
+
+def test_header_truncates_long_display_name_with_full_tooltip(window):
+    """A display name over 40 chars is truncated with the full value in the
+    tooltip (Req 4.2)."""
+    long_name = "A" * 45  # > HEADER_DISPLAY_MAX_LEN (40)
+    window.station_controller.set_active(StationConfig("demo_station_01", long_name))
+
+    expected_shown = long_name[:HEADER_DISPLAY_MAX_LEN] + "..."
+    assert window._station_label.text() == expected_shown
+    assert window._station_label.toolTip() == long_name

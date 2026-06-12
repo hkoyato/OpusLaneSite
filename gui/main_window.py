@@ -42,6 +42,9 @@ from gui.processing_view import ProcessingView
 from gui.resources import ICON_PATH, LOGO_PATH
 from gui.results_view import ResultsView
 from gui.settings import SettingsManager
+from gui.station_controller import StationController
+from gui.station_settings_view import StationSettingsView
+from gui.station_validation import header_label
 from gui.theme import BrandTheme
 from gui.utils import is_valid_video_extension
 from gui.worker import WorkerThread
@@ -92,16 +95,23 @@ _PRIVACY_NOTE = (
 _NAV_INPUT = 0
 _NAV_PROCESSING = 1
 _NAV_RESULTS = 2
+_NAV_STATION = 3
 
 _NAV_ENTRIES = [
     ("input", "Input", True),
     ("processing", "Processing", True),
     ("results", "Results", True),
+    ("station", "Station", True),
     # Future views (dashboard, stream config, zone editor) will be added here
     # once implemented. Hidden until then to avoid showing non-functional items.
 ]
 
-_VIEW_TO_ROW = {"input": _NAV_INPUT, "processing": _NAV_PROCESSING, "results": _NAV_RESULTS}
+_VIEW_TO_ROW = {
+    "input": _NAV_INPUT,
+    "processing": _NAV_PROCESSING,
+    "results": _NAV_RESULTS,
+    "station": _NAV_STATION,
+}
 
 
 class MainWindow(QMainWindow):
@@ -124,6 +134,9 @@ class MainWindow(QMainWindow):
         self._session_detector_backend = "yolo"
         self._total_frames = 0
         self._skipped_frames = 0
+        # Operator-configured active lanes captured at session start; feeds the
+        # deterministic wait-time estimate on the Results view.
+        self._session_active_lanes = 1
 
         self._apply_theme()
         self._build_ui()
@@ -166,12 +179,24 @@ class MainWindow(QMainWindow):
         self.input_panel = InputPanel(self._settings)
         self.processing_view = ProcessingView()
         self.results_view = ResultsView()
+        # Station controller: single source of truth for the active
+        # StationConfig. Constructed after _build_header() (above) created
+        # self._station_label, so the initial label update at the end of this
+        # method can render the active value. The controller emits any
+        # load-time warnings/station_changed during its own construction
+        # (before these slots are connected), so the header is seeded
+        # explicitly via _update_station_label() below (Req 4.1).
+        self.station_controller = StationController(self._settings)
+        self.station_controller.station_changed.connect(self._update_station_label)
+        self.station_controller.warning.connect(self._show_station_warning)
+        self.station_settings_view = StationSettingsView(self.station_controller)
         # Wrap each view in a scroll area so content scrolls rather than being
         # compressed (which overlaps widgets) when the window is short — e.g.
         # at high display-scaling factors. Views keep their natural height.
         self.stack.addWidget(self._scrollable(self.input_panel))      # index 0
         self.stack.addWidget(self._scrollable(self.processing_view))  # index 1
         self.stack.addWidget(self._scrollable(self.results_view))     # index 2
+        self.stack.addWidget(self._scrollable(self.station_settings_view))  # index 3
         middle.addWidget(self.stack, stretch=1)
 
         root.addLayout(middle, stretch=1)
@@ -185,6 +210,13 @@ class MainWindow(QMainWindow):
         self.processing_view.cancel_requested.connect(self._on_cancel_requested)
         self.results_view.new_session_requested.connect(
             lambda: self.switch_view("input")
+        )
+
+        # Seed the header with the active station now that the label and the
+        # controller both exist (Req 4.1). The signal payload is the effective
+        # display name; read it from the controller's active config.
+        self._update_station_label(
+            self.station_controller.active().effective_display_name
         )
 
     def _scrollable(self, widget: QWidget) -> QScrollArea:
@@ -237,6 +269,17 @@ class MainWindow(QMainWindow):
         text_box.addWidget(subtitle)
         layout.addLayout(text_box)
         layout.addStretch(1)
+
+        # Right-aligned active station label (Req 4.1). White text on the
+        # gradient header, matching the title styling.
+        self._station_label = QLabel("")
+        self._station_label.setStyleSheet(
+            f"color: {BrandTheme.WHITE}; font-size: 16px; font-weight: 600;"
+        )
+        self._station_label.setAlignment(
+            Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        )
+        layout.addWidget(self._station_label, 0, Qt.AlignmentFlag.AlignVCenter)
 
         return header
 
@@ -417,6 +460,37 @@ class MainWindow(QMainWindow):
             )
         elif view_name == "results":
             self.setWindowTitle("Opus LaneSight - Results")
+        elif view_name == "station":
+            self.setWindowTitle("Opus LaneSight - Station")
+
+    def _update_station_label(self, display_name: str) -> None:
+        """Render the active Station_Display_Name in the header (Req 4.1, 4.4).
+
+        Applies :func:`header_label` truncation at 40 chars and exposes the
+        full value as a tooltip on hover/focus (Req 4.2). When no active config
+        is loaded (empty display name), shows the "No station selected"
+        placeholder (Req 4.5). The header is persistent across views, so the
+        active station renders on every view (Req 4.1, 4.4).
+        """
+        if not display_name:
+            self._station_label.setText("No station selected")
+            self._station_label.setToolTip("")
+            return
+
+        shown, full = header_label(display_name)
+        self._station_label.setText(shown)
+        self._station_label.setToolTip(full if full is not None else "")
+
+    def _show_station_warning(self, message: str) -> None:
+        """Display a non-blocking station warning (Req 3.4, 3.5, 3.6).
+
+        Routes the message to the pipeline log panel so it never blocks
+        processing or record production, consistent with the existing
+        non-blocking log-routing pattern.
+        """
+        log_view = getattr(self, "log_view", None)
+        if log_view is not None:
+            log_view.appendPlainText(f"Station warning: {message}")
 
     # ------------------------------------------------------------------
     # Processing lifecycle
@@ -484,6 +558,7 @@ class MainWindow(QMainWindow):
         self._session_fps = self._lookup_session_fps()
         self._total_frames = 0
         self._skipped_frames = 0
+        self._session_active_lanes = config.active_lanes
 
         # Create and wire the worker (Qt signals/slots only — Requirement 10.4).
         self._worker = WorkerThread(config)
@@ -519,6 +594,13 @@ class MainWindow(QMainWindow):
         still returns to the input view via ``_on_thread_finished``.
         """
         self._cancelling = False
+        # Surface the active Station_Display_Name in the results header,
+        # captured from the StationController at display time (Req 6.4). The
+        # controller is the single source of truth for the active identity and
+        # is constructed at launch (Req 3.2), so the value is always available.
+        self.results_view.set_station_display_name(
+            self.station_controller.active().effective_display_name
+        )
         self.results_view.display_results(
             results,
             self._session_fps,
@@ -526,6 +608,7 @@ class MainWindow(QMainWindow):
             self._session_output_path,
             self._skipped_frames,
             self._total_frames,
+            self._session_active_lanes,
         )
         self.switch_view("results")
 

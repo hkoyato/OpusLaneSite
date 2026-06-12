@@ -391,3 +391,113 @@ def test_new_fields_round_trip_through_save_and_reload(patched_config):
     assert reloaded.detect_interval == 15
     assert reloaded.no_output is True
     assert reloaded.source_mode == "stream"
+
+
+# ---------------------------------------------------------------------------
+# Station identification — SettingsManager station field handling (task 2.2)
+# ---------------------------------------------------------------------------
+# SettingsManager performs type/shape validation only. Domain validation
+# (Requirement 2) is StationController's responsibility and is NOT asserted
+# here. Documented behaviour: station_id defaults to "demo_station_01" when
+# absent or non-string; station_display_name must be a string of length <= 128
+# (longer values truncated to exactly 128), with non-strings falling back to
+# the validated station_id value.
+# Reference: Requirements 3.1, 3.2
+
+
+def test_station_fields_default_when_absent(patched_config):
+    """When neither station field is present, both default to demo_station_01."""
+    _, config_file = patched_config
+    _write_settings(config_file, confidence=0.5)
+
+    settings = SettingsManager().get()
+
+    assert settings.station_id == "demo_station_01"
+    assert settings.station_display_name == "demo_station_01"
+
+
+@pytest.mark.parametrize("bad_value", [123, None, 4.5, True, ["x"], {"k": "v"}])
+def test_station_id_non_string_falls_back_to_default(patched_config, bad_value):
+    """A non-string station_id falls back to the default demo_station_01."""
+    _, config_file = patched_config
+    _write_settings(config_file, station_id=bad_value)
+
+    assert SettingsManager().get().station_id == "demo_station_01"
+
+
+def test_station_display_name_truncated_to_128(patched_config):
+    """A station_display_name longer than 128 chars truncates to exactly 128."""
+    _, config_file = patched_config
+    long_name = "n" * 200
+    _write_settings(config_file, station_display_name=long_name)
+
+    result = SettingsManager().get().station_display_name
+
+    assert len(result) == 128
+    assert result == long_name[:128]
+
+
+def test_station_display_name_exactly_128_preserved(patched_config):
+    """A station_display_name of exactly 128 chars is preserved unchanged."""
+    _, config_file = patched_config
+    name = "x" * 128
+    _write_settings(config_file, station_display_name=name)
+
+    assert SettingsManager().get().station_display_name == name
+
+
+@pytest.mark.parametrize("bad_value", [123, None, 9.9, True, ["d"], {"k": "v"}])
+def test_station_display_name_non_string_falls_back_to_station_id(
+    patched_config, bad_value
+):
+    """A non-string display name falls back to the validated station_id value."""
+    _, config_file = patched_config
+    _write_settings(
+        config_file, station_id="lane_station_7", station_display_name=bad_value
+    )
+
+    settings = SettingsManager().get()
+
+    assert settings.station_id == "lane_station_7"
+    assert settings.station_display_name == "lane_station_7"
+
+
+def test_station_display_name_non_string_falls_back_to_default_when_id_absent(
+    patched_config,
+):
+    """Non-string display name with absent id falls back to the default id."""
+    _, config_file = patched_config
+    _write_settings(config_file, station_display_name=None)
+
+    settings = SettingsManager().get()
+
+    assert settings.station_id == "demo_station_01"
+    assert settings.station_display_name == "demo_station_01"
+
+
+def test_station_fields_round_trip_through_save_and_reload(patched_config):
+    """Custom station fields persist and reload identically."""
+    _, config_file = patched_config
+    _write_settings(
+        config_file,
+        station_id="north_gate_03",
+        station_display_name="North Gate Inspection",
+    )
+
+    SettingsManager().save()  # rewrite validated values
+    reloaded = SettingsManager().get()
+
+    assert reloaded.station_id == "north_gate_03"
+    assert reloaded.station_display_name == "North Gate Inspection"
+
+
+def test_station_fields_set_via_update_round_trip(patched_config):
+    """update() persists station fields that survive a fresh reload."""
+    mgr = SettingsManager()
+
+    mgr.update(station_id="bay_12", station_display_name="Bay 12 Station")
+    mgr.save()
+
+    reloaded = SettingsManager().get()
+    assert reloaded.station_id == "bay_12"
+    assert reloaded.station_display_name == "Bay 12 Station"

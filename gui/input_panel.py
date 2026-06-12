@@ -81,6 +81,10 @@ _MAX_AWS_REGION_LENGTH = 64
 _DETECT_INTERVAL_MIN = 1
 _DETECT_INTERVAL_MAX = 60
 
+# Active-lanes (manual station override) bounds.
+_ACTIVE_LANES_MIN = 1
+_ACTIVE_LANES_MAX = 99
+
 # Privacy note shown for Rekognition + plate reading (Req 12.9 / Req 1.5).
 _PRIVACY_NOTE = (
     "Plate text reading is opt-in and used for development and testing only. "
@@ -428,6 +432,29 @@ class InputPanel(QWidget):
         self.rekognition_hint.setVisible(False)
         layout.addWidget(self.rekognition_hint)
 
+        # --- Active lanes (manual station override) ---------------------
+        # The single-camera pipeline cannot detect lane count, so the number
+        # of active inspection lanes is an operator-set value that feeds the
+        # deterministic public wait-time formula (product overview §12/§14)
+        # rather than a fabricated constant.
+        lanes_row = QHBoxLayout()
+        lanes_row.setSpacing(12)
+        lanes_label = QLabel("Active lanes")
+        lanes_label.setMinimumWidth(180)
+        lanes_row.addWidget(lanes_label)
+        self.active_lanes_spin = QSpinBox()
+        self.active_lanes_spin.setRange(_ACTIVE_LANES_MIN, _ACTIVE_LANES_MAX)
+        self.active_lanes_spin.setSingleStep(1)
+        self.active_lanes_spin.setValue(1)
+        self.active_lanes_spin.setToolTip(
+            "Number of inspection lanes serving the queue (1\u201399). Set this "
+            "to your station's lane count; it feeds the wait-time estimate."
+        )
+        self.active_lanes_spin.valueChanged.connect(self._on_active_lanes_changed)
+        lanes_row.addWidget(self.active_lanes_spin)
+        lanes_row.addStretch(1)
+        layout.addLayout(lanes_row)
+
         # Privacy note shown for Rekognition + plate reading (Req 12.9).
         self.privacy_note = QLabel(_PRIVACY_NOTE)
         self.privacy_note.setWordWrap(True)
@@ -503,7 +530,9 @@ class InputPanel(QWidget):
                 max(_DETECT_INTERVAL_MIN, min(_DETECT_INTERVAL_MAX, int(s.detect_interval)))
             )
             self.no_output_toggle.setChecked(bool(s.no_output))
-
+            self.active_lanes_spin.setValue(
+                max(_ACTIVE_LANES_MIN, min(_ACTIVE_LANES_MAX, int(s.active_lanes)))
+            )
             # Sync conditional visibility/enabled state to restored values.
             # (setCurrentText only emits when the value changes, so apply
             # the handlers explicitly while still in the loading guard.)
@@ -721,6 +750,9 @@ class InputPanel(QWidget):
     def _on_detect_interval_changed(self, value: int) -> None:
         self._save_settings(detect_interval=int(value))
 
+    def _on_active_lanes_changed(self, value: int) -> None:
+        self._save_settings(active_lanes=int(value))
+
     def on_no_output_toggled(self, enabled: bool) -> None:
         """Disable the output path selector when no-output is enabled (Req 15.2/15.3/15.6)."""
         self.output_path_edit.setEnabled(not enabled)
@@ -783,6 +815,7 @@ class InputPanel(QWidget):
             aws_region=aws_region,
             detect_interval=self.detect_interval_spin.value(),
             no_output=no_output,
+            active_lanes=self.active_lanes_spin.value(),
         )
 
     def validate_before_start(self) -> str | None:

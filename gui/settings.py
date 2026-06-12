@@ -119,6 +119,9 @@ class SettingsManager:
         - detect_interval: clamp to [1, 60], non-int falls back to 1
         - no_output: coerce to bool
         - source_mode: one of {"file", "stream"}, default "file"
+        - station_id: string; default "demo_station_01" when absent/non-string
+        - station_display_name: string <= 128 chars (truncated); non-string
+          falls back to station_id
         """
         # confidence
         try:
@@ -203,10 +206,34 @@ class SettingsManager:
         # no_output
         no_output = bool(data.get("no_output", False))
 
+        # active_lanes: operator-configured manual override. Clamp to [1, 99];
+        # non-int (incl. bool) falls back to 1. Floored at 1 so the wait-time
+        # formula never divides by zero.
+        raw_lanes = data.get("active_lanes", 1)
+        if isinstance(raw_lanes, bool) or not isinstance(raw_lanes, int):
+            active_lanes = 1
+        else:
+            active_lanes = max(1, min(99, raw_lanes))
+
         # source_mode
         source_mode = data.get("source_mode", "file")
         if source_mode not in ("file", "stream"):
             source_mode = "file"
+
+        # station_id: type/shape only; domain validation (Req 2) lives in
+        # StationController. Default to "demo_station_01" when absent/non-string;
+        # preserve the raw stored value as-is otherwise.
+        station_id = data.get("station_id", "demo_station_01")
+        if not isinstance(station_id, str):
+            station_id = "demo_station_01"
+
+        # station_display_name: string of length <= 128 (truncate longer values);
+        # non-strings fall back to the validated station_id.
+        station_display_name = data.get("station_display_name", station_id)
+        if not isinstance(station_display_name, str):
+            station_display_name = station_id
+        elif len(station_display_name) > 128:
+            station_display_name = station_display_name[:128]
 
         return AppSettings(
             confidence=confidence,
@@ -223,6 +250,9 @@ class SettingsManager:
             detect_interval=detect_interval,
             no_output=no_output,
             source_mode=source_mode,
+            active_lanes=active_lanes,
+            station_id=station_id,
+            station_display_name=station_display_name,
         )
 
     def _schedule_save(self) -> None:
