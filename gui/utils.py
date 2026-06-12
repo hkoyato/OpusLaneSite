@@ -180,6 +180,46 @@ def is_valid_aws_region(region: str) -> bool:
     return 1 <= len(trimmed) <= _MAX_AWS_REGION_LENGTH
 
 
+def rekognition_setup_error(region: str) -> str | None:
+    """Return a user-facing setup error for AWS Rekognition, if any.
+
+    This performs a local SDK/credential check only. It intentionally avoids a
+    Rekognition API call so the Start button does not incur network latency or
+    AWS charges just to validate setup.
+    """
+    try:
+        import boto3
+        from botocore.exceptions import (
+            BotoCoreError,
+            NoCredentialsError,
+            PartialCredentialsError,
+            ProfileNotFound,
+        )
+    except ImportError as exc:
+        return (
+            "AWS Rekognition support is not installed. Install the AWS "
+            f"dependencies, then try again. Details: {exc}"
+        )
+
+    try:
+        session = boto3.Session(region_name=region.strip() or None)
+        credentials = session.get_credentials()
+        if credentials is None:
+            return "AWS credentials were not found on this machine."
+
+        # Force deferred providers (for example shared config/profile lookups)
+        # to resolve now, before the worker starts processing frames.
+        frozen = credentials.get_frozen_credentials()
+        if not frozen.access_key or not frozen.secret_key:
+            return "AWS credentials are incomplete on this machine."
+    except (NoCredentialsError, PartialCredentialsError, ProfileNotFound) as exc:
+        return f"AWS credentials could not be loaded. Details: {exc}"
+    except BotoCoreError as exc:
+        return f"AWS setup could not be verified. Details: {exc}"
+
+    return None
+
+
 def clamp_detect_interval(value: float) -> int:
     """Clamp *value* to the valid detection-interval range [1, 60].
 

@@ -21,7 +21,7 @@ from PySide6.QtWidgets import QMessageBox
 
 import gui.main_window as main_window_module
 from gui.main_window import MainWindow
-from gui.models import AppSettings
+from gui.models import AppSettings, ProcessingConfig
 
 
 # ---------------------------------------------------------------------------
@@ -159,6 +159,16 @@ class FakeMessageBox:
         return None
 
 
+class CapturingMessageBox(FakeMessageBox):
+    """QMessageBox stand-in that records warning calls."""
+
+    warnings: list[tuple[object, str, str]] = []
+
+    @staticmethod
+    def warning(parent: object, title: str, body: str) -> None:
+        CapturingMessageBox.warnings.append((parent, title, body))
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -278,6 +288,42 @@ def test_drop_invalid_extension_is_rejected(window, monkeypatch):
 
     assert event.isAccepted() is False
     assert captured == []
+
+
+def test_rekognition_without_setup_shows_warning_and_does_not_start(
+    window, monkeypatch
+):
+    """Missing local AWS setup blocks Rekognition before the worker starts."""
+    config = ProcessingConfig(
+        video_path="C:/videos/clip.mp4",
+        output_path=None,
+        confidence=0.5,
+        ocr_enabled=False,
+        detector_backend="rekognition",
+        aws_region="us-east-1",
+        no_output=True,
+    )
+    CapturingMessageBox.warnings.clear()
+    monkeypatch.setattr(
+        main_window_module,
+        "rekognition_setup_error",
+        lambda _region: "AWS credentials were not found on this machine.",
+    )
+    monkeypatch.setattr(main_window_module, "QMessageBox", CapturingMessageBox)
+    monkeypatch.setattr(
+        main_window_module,
+        "WorkerThread",
+        lambda *_args, **_kwargs: pytest.fail("Worker should not start"),
+    )
+
+    window.start_processing(config)
+
+    assert window._worker is None
+    assert len(CapturingMessageBox.warnings) == 1
+    _parent, title, body = CapturingMessageBox.warnings[0]
+    assert title == "AWS Rekognition setup required"
+    assert "aws configure" in body.lower()
+    assert "rekognition:detectlabels" in body.lower()
 
 
 # ---------------------------------------------------------------------------

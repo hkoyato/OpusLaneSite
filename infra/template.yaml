@@ -1,0 +1,295 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+
+Description: >
+  Station Statistics API (Opus LaneSight) - API Gateway + Lambda + DynamoDB.
+  Task 8.1: API Gateway resources, methods, and policies (Infrastructure-as-Code).
+
+  IaC tool decision
+  -----------------
+  No existing IaC convention was found in this repository (no Serverless
+  Framework, SAM, Terraform, or CDK files). AWS SAM / CloudFormation was chosen
+  because it is the most self-contained, demoable artifact for this serverless
+  REST API: a single declarative YAML template provisions the API Gateway REST
+  API, the Lambda handlers, the authorizer, and the DynamoDB Statistics_Store
+  with no extra toolchain beyond the AWS CLI / SAM CLI.
+
+  Intrinsic functions use the longhand form (Ref:, Fn::GetAtt:, Fn::Sub:)
+  rather than the !Ref / !GetAtt short tags so the template parses cleanly with
+  a plain YAML loader (yaml.safe_load) while remaining valid CloudFormation/SAM.
+
+  Lambda Handler values point at station_stats_api.lambda_handler.* - the event
+  adapter that translates API Gateway proxy events into handle_snapshot /
+  get_station / list_stations calls is implemented in task 8.2. These are
+  integration placeholders for this IaC task.
+
+# ---------------------------------------------------------------------------
+# Parameters
+# ---------------------------------------------------------------------------
+Parameters:
+  StageName:
+    Type: String
+    Default: prod
+    Description: API Gateway deployment stage name.
+
+  DomainName:
+    Type: String
+    Default: ""
+    Description: >
+      Fully-qualified custom domain name for the API (e.g.
+      stats.lanesight.example.com). Leave empty to skip custom-domain creation
+      and use the default execute-api HTTPS endpoint. HTTP is never exposed.
+
+  CertificateArn:
+    Type: String
+    Default: ""
+    Description: >
+      ACM certificate ARN for the custom domain. Required only when DomainName
+      is set. The certificate must be in the API's region for a REGIONAL domain.
+
+  TableName:
+    Type: String
+    Default: StationStatistics
+    Description: DynamoDB table name for the Statistics_Store.
+
+Conditions:
+  HasCustomDomain:
+    Fn::Not:
+      - Fn::Equals:
+          - Ref: DomainName
+          - ""
+
+# ---------------------------------------------------------------------------
+# Globals
+# ---------------------------------------------------------------------------
+Globals:
+  Function:
+    Runtime: python3.12
+    MemorySize: 256
+    Timeout: 10
+    Architectures:
+      - x86_64
+    Environment:
+      Variables:
+        STATISTICS_TABLE_NAME:
+          Ref: TableName
+
+Resources:
+
+  # -------------------------------------------------------------------------
+  # DynamoDB - Statistics_Store
+  # Mirrors station_stats_api.dynamo_store.build_table_definition:
+  #   partition key station_id (S), no sort key, PAY_PER_REQUEST (on-demand).
+  # One current snapshot per station; on-demand billing scales to 50-100+
+  # stations with no provisioning change (Req 6.3, 4.5).
+  # -------------------------------------------------------------------------
+  StatisticsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName:
+        Ref: TableName
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: station_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: station_id
+          KeyType: HASH
+      SSESpecification:
+        SSEEnabled: true
+
+  # -------------------------------------------------------------------------
+  # REST API
+  #
+  # Auth / credentials (Req 3.1, 3.2, 3.3):
+  #   A Lambda REQUEST authorizer (CredentialAuthorizer) enforces the
+  #   Client_Credential on every method.
+  #     * Missing credential  -> the authorizer raises "Unauthorized", which
+  #       API Gateway surfaces as HTTP 401 via the UNAUTHORIZED GatewayResponse.
+  #     * Unknown / revoked credential -> the authorizer returns an IAM policy
+  #       with Effect "Deny", which API Gateway surfaces as HTTP 403 via the
+  #       ACCESS_DENIED GatewayResponse.
+  #   This cleanly separates 401 (no credential) from 403 (bad credential).
+  #
+  # HTTPS-only (Req 3.4, 3.6):
+  #   API Gateway only ever exposes an HTTPS (TLS) endpoint - there is no HTTP
+  #   listener to disable. The optional custom domain (below) pins a modern TLS
+  #   security policy. No plaintext HTTP is reachable.
+  #
+  # 16KB request size limit (Req 1.1, 1.6):
+  #   API Gateway's hard payload ceiling is 10MB; the 16KB business limit is
+  #   enforced two ways: (a) the Snapshot Lambda rejects bodies > 16KB with 413,
+  #   and (b) the REQUEST_TOO_LARGE GatewayResponse below maps any gateway-level
+  #   oversize rejection to a generic 413 body.
+  #
+  # Method-not-allowed -> 405 (Req 1.5, 5.7):
+  #   Only the three documented methods are defined. A request using a
+  #   non-matching method on a defined resource is mapped to 405 by the
+  #   DEFAULT_4XX GatewayResponse (overriding API Gateway's default 403 for
+  #   unmatched methods) so callers receive a correct Method-Not-Allowed.
+  # -------------------------------------------------------------------------
+  StationStatsApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: station-stats-api
+      StageName:
+        Ref: StageName
+      EndpointConfiguration:
+        Type: REGIONAL
+      # Reject any body larger than 16KB at the gateway (16 * 1024 bytes).
+      MinimumCompressionSize: 0
+      Auth:
+        DefaultAuthorizer: CredentialAuthorizer
+        Authorizers:
+          CredentialAuthorizer:
+            FunctionArn:
+              Fn::GetAtt:
+                - AuthorizerFunction
+                - Arn
+            # REQUEST authorizer: inspect the credential header on every call.
+            FunctionPayloadType: REQUEST
+            Identity:
+              Headers:
+                - X-Client-Credential
+              # Do not cache so revoked credentials take effect immediately.
+              ReauthorizeEvery: 0
+      # Generic, detail-free bodies for auth + size + method errors and all
+      # 5xx responses (Req 10.4 - no stack traces or internal detail).
+      GatewayResponses:
+        UNAUTHORIZED:
+          StatusCode: 401
+          ResponseTemplates:
+            application/json: '{"error":"Authentication required."}'
+        ACCESS_DENIED:
+          StatusCode: 403
+          ResponseTemplates:
+            application/json: '{"error":"Not authorized."}'
+        REQUEST_TOO_LARGE:
+          StatusCode: 413
+          ResponseTemplates:
+            application/json: '{"error":"Request exceeds the maximum allowed body size of 16KB."}'
+        DEFAULT_4XX:
+          StatusCode: 405
+          ResponseTemplates:
+            application/json: '{"error":"Method not allowed."}'
+        DEFAULT_5XX:
+          ResponseTemplates:
+            application/json: '{"error":"The request could not be completed."}'
+
+  # -------------------------------------------------------------------------
+  # Optional HTTPS-only custom domain (Req 3.4, 3.6)
+  # TLS 1.2 security policy; REGIONAL endpoint. Created only when DomainName is
+  # provided. There is no HTTP counterpart - only TLS is exposed.
+  # -------------------------------------------------------------------------
+  ApiDomainName:
+    Type: AWS::ApiGateway::DomainName
+    Condition: HasCustomDomain
+    Properties:
+      DomainName:
+        Ref: DomainName
+      RegionalCertificateArn:
+        Ref: CertificateArn
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      SecurityPolicy: TLS_1_2
+
+  ApiBasePathMapping:
+    Type: AWS::ApiGateway::BasePathMapping
+    Condition: HasCustomDomain
+    Properties:
+      DomainName:
+        Ref: ApiDomainName
+      RestApiId:
+        Ref: StationStatsApi
+      Stage:
+        Ref: StageName
+
+  # -------------------------------------------------------------------------
+  # Lambda: credential authorizer (placeholder - logic detailed in task 8.2)
+  # Produces 401 (raise Unauthorized) for a missing credential and a Deny
+  # policy -> 403 for an unknown/revoked credential.
+  # -------------------------------------------------------------------------
+  AuthorizerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: station-stats-authorizer
+      CodeUri: ../
+      Handler: station_stats_api.lambda_handler.authorizer_handler
+
+  # -------------------------------------------------------------------------
+  # Lambda: Snapshot (POST) handler -> wraps handle_snapshot (task 4.1 / 8.2)
+  # Only the POST method is defined on the snapshot resource; any other method
+  # falls through to the 405 GatewayResponse (Req 1.5).
+  # -------------------------------------------------------------------------
+  SnapshotFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: station-stats-snapshot
+      CodeUri: ../
+      Handler: station_stats_api.lambda_handler.snapshot_handler
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName:
+              Ref: TableName
+      Events:
+        PostSnapshot:
+          Type: Api
+          Properties:
+            RestApiId:
+              Ref: StationStatsApi
+            Path: /stations/{station_id}/snapshot
+            Method: post
+
+  # -------------------------------------------------------------------------
+  # Lambda: Metrics (GET) handler -> wraps get_station / list_stations
+  # (task 5.1 / 8.2). Only GET is defined on the metrics resources; any other
+  # method falls through to the 405 GatewayResponse (Req 5.7).
+  # -------------------------------------------------------------------------
+  MetricsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: station-stats-metrics
+      CodeUri: ../
+      Handler: station_stats_api.lambda_handler.metrics_handler
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName:
+              Ref: TableName
+      Events:
+        GetStation:
+          Type: Api
+          Properties:
+            RestApiId:
+              Ref: StationStatsApi
+            Path: /stations/{station_id}
+            Method: get
+        ListStations:
+          Type: Api
+          Properties:
+            RestApiId:
+              Ref: StationStatsApi
+            Path: /stations
+            Method: get
+
+# ---------------------------------------------------------------------------
+# Outputs
+# ---------------------------------------------------------------------------
+Outputs:
+  ApiBaseUrl:
+    Description: >
+      Default HTTPS base URL for the deployed API (execute-api). Use the custom
+      domain instead when DomainName is configured.
+    Value:
+      Fn::Sub: "https://${StationStatsApi}.execute-api.${AWS::Region}.amazonaws.com/${StageName}"
+
+  CustomDomainUrl:
+    Condition: HasCustomDomain
+    Description: HTTPS-only custom domain base URL for the API.
+    Value:
+      Fn::Sub: "https://${DomainName}"
+
+  StatisticsTableName:
+    Description: DynamoDB Statistics_Store table name.
+    Value:
+      Ref: StatisticsTable

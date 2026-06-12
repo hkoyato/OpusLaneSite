@@ -46,7 +46,7 @@ from gui.station_controller import StationController
 from gui.station_settings_view import StationSettingsView
 from gui.station_validation import header_label
 from gui.theme import BrandTheme
-from gui.utils import is_valid_video_extension
+from gui.utils import is_valid_video_extension, rekognition_setup_error
 from gui.worker import WorkerThread
 
 # Vehicle detection model. Located via gui.assets.resolve_model, which searches
@@ -498,6 +498,20 @@ class MainWindow(QMainWindow):
 
     def start_processing(self, config: ProcessingConfig) -> None:
         """Validate preconditions, launch the worker, and show processing view."""
+        if config.detector_backend == "rekognition":
+            setup_error = rekognition_setup_error(config.aws_region)
+            if setup_error is not None:
+                QMessageBox.warning(
+                    self,
+                    "AWS Rekognition setup required",
+                    f"{setup_error}\n\n"
+                    "Run 'pip install awscli' and 'aws configure', then make "
+                    "sure the configured IAM identity has the "
+                    "rekognition:DetectLabels and rekognition:DetectText "
+                    "permissions.",
+                )
+                return
+
         # Requirement 8.1 — the local vehicle detection model must be available.
         # This check applies only to the local YOLOv8 backend; the AWS
         # Rekognition backend needs no local model (Requirement 12.4), so it is
