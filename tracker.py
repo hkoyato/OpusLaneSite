@@ -9,6 +9,8 @@ Key design to avoid duplicate counting during occlusions:
 - If a match is found, the old track is revived instead of creating a duplicate
 """
 
+from __future__ import annotations
+
 import numpy as np
 from scipy.optimize import linear_sum_assignment
 
@@ -143,6 +145,7 @@ class TrackedVehicle:
         # Track state
         self.is_occluded = False
         self.occlusion_count = 0  # How many times this track was occluded and recovered
+        self.visibility = 1.0  # 0-1, how visible the vehicle currently is
 
     def predict(self):
         """Predict next position using Kalman filter."""
@@ -152,6 +155,7 @@ class TrackedVehicle:
         # Mark as potentially occluded after several missing frames
         if self.frames_since_seen > 5:
             self.is_occluded = True
+            self.visibility = max(0.1, 1.0 - self.frames_since_seen * 0.1)
 
     def update(self, bbox, frame_idx, plate_bbox=None):
         """Update track with new detection."""
@@ -163,6 +167,7 @@ class TrackedVehicle:
             self.is_occluded = False
         self.frames_since_seen = 0
         self.hit_count += 1
+        self.visibility = 1.0
         if plate_bbox is not None:
             self.plate_bbox = plate_bbox
 
@@ -193,20 +198,22 @@ class TrackedVehicle:
             self.appearance_features.pop(0)
 
     def get_appearance_similarity(self, feature):
-        """Compute cosine similarity between feature and stored history."""
+        """Compute cosine similarity between feature and stored history (vectorized)."""
         if not self.appearance_features or feature is None:
             return 0.0
 
-        similarities = []
-        for stored in self.appearance_features:
-            norm_a = np.linalg.norm(feature)
-            norm_b = np.linalg.norm(stored)
-            if norm_a < 1e-6 or norm_b < 1e-6:
-                continue
-            sim = np.dot(feature, stored) / (norm_a * norm_b)
-            similarities.append(sim)
+        feature_norm = np.linalg.norm(feature)
+        if feature_norm < 1e-6:
+            return 0.0
 
-        return max(similarities) if similarities else 0.0
+        gallery = np.array(self.appearance_features)
+        norms = np.linalg.norm(gallery, axis=1)
+        valid = norms > 1e-6
+        if not np.any(valid):
+            return 0.0
+
+        similarities = gallery[valid] @ feature / (norms[valid] * feature_norm)
+        return float(np.max(similarities))
 
     def get_avg_appearance(self):
         """Get average appearance feature (for gallery matching)."""

@@ -11,9 +11,11 @@ import cv2
 import numpy as np
 
 from detector import VehicleDetector
+from detector_rekognition import RekognitionDetector
 from tracker import VehicleTracker
 from ocr import PlateOCR, PlateTextAggregator
 from appearance import AppearanceExtractor
+from plate_utils import plates_are_similar, normalize_plate, edit_distance, pick_best_plate
 
 
 def _resize_for_display(frame, target_width):
@@ -29,14 +31,7 @@ def _resize_for_display(frame, target_width):
 def _deduplicate_by_plate(tracks):
     """
     Merge tracks that have the same or similar plate text.
-
-    Uses fuzzy matching that accounts for common OCR errors:
-    - Leading/trailing characters added by noise (E before W)
-    - 1↔7, 0↔O, 8↔B confusion
-    - One or two character differences
-
-    If two tracks have similar plate text, they are merged into one
-    spanning the full time range.
+    Uses fuzzy matching from plate_utils to handle OCR errors.
     """
     plate_tracks = []
     no_plate_tracks = []
@@ -50,11 +45,9 @@ def _deduplicate_by_plate(tracks):
     if not plate_tracks:
         return tracks
 
-    # Build groups of similar plates
     groups = []
     used = set()
 
-    # Sort by confidence descending — higher confidence plates are "anchors"
     plate_tracks.sort(key=lambda t: t.plate_confidence, reverse=True)
 
     for i, track in enumerate(plate_tracks):
@@ -66,21 +59,23 @@ def _deduplicate_by_plate(tracks):
         for j in range(i + 1, len(plate_tracks)):
             if j in used:
                 continue
-            if _plates_are_similar(track.plate_text, plate_tracks[j].plate_text):
+            if plates_are_similar(track.plate_text, plate_tracks[j].plate_text):
                 group.append(plate_tracks[j])
                 used.add(j)
 
         groups.append(group)
 
-    # Merge each group into a single track
     merged_tracks = []
     for group in groups:
         if len(group) == 1:
             merged_tracks.append(group[0])
         else:
-            # Primary = highest confidence reading
-            group.sort(key=lambda t: t.plate_confidence, reverse=True)
+            best_plate = pick_best_plate([t.plate_text for t in group])
+
+            group.sort(key=lambda t: t.hit_count, reverse=True)
             primary = group[0]
+            primary.plate_text = best_plate
+            primary.plate_confidence = max(t.plate_confidence for t in group)
             for other in group[1:]:
                 primary.first_frame = min(primary.first_frame, other.first_frame)
                 primary.last_frame = max(primary.last_frame, other.last_frame)
@@ -88,97 +83,6 @@ def _deduplicate_by_plate(tracks):
             merged_tracks.append(primary)
 
     return merged_tracks + no_plate_tracks
-
-
-def _plates_are_similar(plate_a, plate_b):
-    """
-    Check if two plate texts are likely the same plate with OCR errors.
-
-    Accounts for:
-    - Common character confusions (1↔7, 0↔O, 5↔S, 8↔B, I↔1)
-    - Extra leading/trailing characters from noise
-    - Standard edit distance
-    """
-    a = plate_a.upper()
-    b = plate_b.upper()
-
-    # Exact match
-    if a == b:
-        return True
-
-    # Normalize OCR-confusable characters and compare
-    norm_a = _normalize_plate(a)
-    norm_b = _normalize_plate(b)
-    if norm_a == norm_b:
-        return True
-
-    # Check if one is a substring of the other (extra chars from noise)
-    if norm_a in norm_b or norm_b in norm_a:
-        return True
-
-    # Check with leading/trailing char stripped (common OCR artifact)
-    if len(a) > len(b):
-        longer, shorter = norm_a, norm_b
-    else:
-        longer, shorter = norm_b, norm_a
-
-    # Try removing 1 char from start or end of longer
-    if len(longer) - len(shorter) <= 2:
-        for start in range(len(longer) - len(shorter) + 1):
-            substr = longer[start:start + len(shorter)]
-            if substr == shorter:
-                return True
-
-    # Edit distance on normalized text
-    dist = _edit_distance(norm_a, norm_b)
-    max_len = max(len(norm_a), len(norm_b))
-    if max_len == 0:
-        return True
-
-    # Allow up to 30% difference or 2 chars, whichever is more generous
-    threshold = max(2, int(max_len * 0.3))
-    return dist <= threshold
-
-
-def _normalize_plate(text):
-    """
-    Normalize plate text by mapping OCR-confusable characters to canonical forms.
-    This makes comparison robust to common OCR mistakes.
-    """
-    # Map visually similar characters to a canonical form
-    char_map = {
-        "O": "0",   # O looks like 0
-        "I": "1",   # I looks like 1
-        "L": "1",   # L can look like 1 in some fonts
-        "Z": "2",   # Z looks like 2
-        "S": "5",   # S looks like 5
-        "B": "8",   # B looks like 8
-        "G": "6",   # G can look like 6
-        "7": "1",   # 7 and 1 are commonly confused
-    }
-    result = ""
-    for ch in text.upper():
-        result += char_map.get(ch, ch)
-    return result
-
-
-def _edit_distance(s1, s2):
-    """Compute Levenshtein edit distance."""
-    m, n = len(s1), len(s2)
-    dp = [[0] * (n + 1) for _ in range(m + 1)]
-    for i in range(m + 1):
-        dp[i][0] = i
-    for j in range(n + 1):
-        dp[0][j] = j
-    for i in range(1, m + 1):
-        for j in range(1, n + 1):
-            cost = 0 if s1[i - 1] == s2[j - 1] else 1
-            dp[i][j] = min(
-                dp[i - 1][j] + 1,
-                dp[i][j - 1] + 1,
-                dp[i - 1][j - 1] + cost,
-            )
-    return dp[m][n]
 
 
 def draw_annotations(frame, tracks):
@@ -253,6 +157,7 @@ def print_results(tracks, fps):
 
 def process_video(
     video_path,
+    stream_url,
     output_path,
     confidence,
     show,
@@ -261,30 +166,65 @@ def process_video(
     ocr_interval,
     no_ocr,
     display_width,
+    detector_backend,
+    aws_region,
+    detect_interval,
 ):
-    """Main processing pipeline."""
+    """Main processing pipeline. Handles both file and live stream input."""
+    import time as _time
+
+    # Determine input source
+    is_stream = stream_url is not None
+    source = stream_url if is_stream else video_path
+
+    if not source:
+        print("Error: Provide --video (file) or --stream (RTSP/RTMP URL)")
+        return
+
     # Initialize video capture
-    cap = cv2.VideoCapture(video_path)
+    cap = cv2.VideoCapture(source)
+    if is_stream:
+        # Optimize for live streams: reduce buffer to minimize latency
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
+
     if not cap.isOpened():
-        print(f"Error: Cannot open video file '{video_path}'")
+        print(f"Error: Cannot open {'stream' if is_stream else 'video'}: '{source}'")
         return
 
     fps = cap.get(cv2.CAP_PROP_FPS)
+    if fps <= 0 or is_stream:
+        fps = 25.0  # Default FPS for streams that don't report it
     width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) if not is_stream else -1
 
-    print(f"Video: {video_path}")
-    print(f"Resolution: {width}x{height}, FPS: {fps:.1f}, Frames: {total_frames}")
+    if is_stream:
+        print(f"Stream: {source}")
+        print(f"Resolution: {width}x{height}, FPS: {fps:.1f} (estimated)")
+        print("Press 'q' in the display window to stop.")
+    else:
+        print(f"Video: {source}")
+        print(f"Resolution: {width}x{height}, FPS: {fps:.1f}, Frames: {total_frames}")
     print(f"OCR: {'disabled' if no_ocr else f'enabled (languages={ocr_languages}, interval={ocr_interval} frames)'}")
+    if detect_interval > 1:
+        print(f"Detection interval: every {detect_interval} frames (Kalman prediction between)")
     print()
 
     # Initialize components
-    detector = VehicleDetector(
-        vehicle_model_path="yolov8n.pt",
-        plate_model_path=plate_model_path,
-        confidence=confidence,
-    )
+    if detector_backend == "rekognition":
+        print(f"Using AWS Rekognition detector (region: {aws_region})")
+        detector = RekognitionDetector(
+            region_name=aws_region,
+            confidence=confidence,
+            use_rekognition_text=True,
+        )
+    else:
+        print("Using YOLOv8 local detector")
+        detector = VehicleDetector(
+            vehicle_model_path="yolov8n.pt",
+            plate_model_path=plate_model_path,
+            confidence=confidence,
+        )
 
     tracker = VehicleTracker(
         iou_threshold=0.3,
@@ -297,6 +237,7 @@ def process_video(
 
     appearance_extractor = AppearanceExtractor(feature_dim=128)
 
+    # Always create aggregator when Rekognition is the backend (it reads text for free)
     plate_ocr = None
     text_aggregator = None
     if not no_ocr:
@@ -304,40 +245,103 @@ def process_video(
         plate_ocr = PlateOCR(languages=ocr_languages, gpu=True)
         text_aggregator = PlateTextAggregator(min_readings=3, agreement_threshold=0.4)
         print("OCR ready.")
+    elif detector_backend == "rekognition":
+        text_aggregator = PlateTextAggregator(min_readings=2, agreement_threshold=0.4)
+        print("Using Rekognition text detection (EasyOCR disabled).")
 
-    # Initialize video writer
+    # Initialize video writer (only for file input or if explicitly requested for stream)
     writer = None
-    if output_path:
+    if output_path and not is_stream:
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
         writer = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+    elif output_path and is_stream:
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        writer = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+        print(f"Recording stream to: {output_path}")
 
     frame_idx = 0
+    start_time = _time.time()
+    reconnect_attempts = 0
+    max_reconnect = 5
 
     while True:
         ret, frame = cap.read()
+
         if not ret:
-            break
+            if is_stream:
+                # Stream disconnected — attempt reconnection
+                reconnect_attempts += 1
+                if reconnect_attempts > max_reconnect:
+                    print(f"\nStream lost after {max_reconnect} reconnection attempts.")
+                    break
+                print(f"\nStream interrupted. Reconnecting ({reconnect_attempts}/{max_reconnect})...")
+                _time.sleep(2)
+                cap.release()
+                cap = cv2.VideoCapture(source)
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 2)
+                if cap.isOpened():
+                    print("Reconnected.")
+                    reconnect_attempts = 0
+                continue
+            else:
+                break  # End of file
 
-        # Detect vehicles and plates
-        detections = detector.detect(frame)
+        reconnect_attempts = 0  # Reset on successful read
 
-        # Extract appearance features for all detections
-        features = None
-        if detections:
-            bboxes = [d["bbox"] for d in detections]
-            features = appearance_extractor.extract_batch(frame, bboxes)
+        # Detect vehicles and plates (skip frames to reduce API/GPU load)
+        run_detection = (frame_idx % detect_interval == 0)
 
-        # Update tracker with detections and features
-        active_tracks = tracker.update(detections, frame_idx, features)
+        if run_detection:
+            detections = detector.detect(frame)
 
-        # Run OCR on plate regions periodically with multi-frame voting
+            # Extract appearance features for all detections
+            features = None
+            if detections:
+                bboxes = [d["bbox"] for d in detections]
+                features = appearance_extractor.extract_batch(frame, bboxes)
+
+            # Update tracker with detections and features
+            active_tracks = tracker.update(detections, frame_idx, features)
+
+            # Feed Rekognition plate text directly into aggregator (avoids EasyOCR)
+            if text_aggregator and detector_backend == "rekognition":
+                for det in detections:
+                    plate_text = det.get("plate_text")
+                    plate_conf = det.get("plate_text_conf", 0.0)
+                    if plate_text and plate_conf > 0.5:
+                        # Find matching track for this detection
+                        for track in active_tracks:
+                            if track.bbox == det["bbox"] or (
+                                track.plate_bbox == det.get("plate_bbox")
+                                and track.plate_bbox is not None
+                            ):
+                                text_aggregator.add_reading(
+                                    track.vehicle_id, plate_text, plate_conf,
+                                    track.visibility,
+                                )
+                                break
+        else:
+            # No detection this frame — tracker predicts using Kalman
+            active_tracks = tracker.update([], frame_idx, None)
+
+        # Run EasyOCR on plate regions periodically (skip if Rekognition already read text)
         if plate_ocr and frame_idx % ocr_interval == 0:
             for track in active_tracks:
                 if track.frames_since_seen == 0 and track.plate_bbox is not None:
                     text, conf = plate_ocr.read_plate(frame, track.plate_bbox)
                     if text:
-                        text_aggregator.add_reading(track.vehicle_id, text, conf)
-                    # Update track with consensus text
+                        text_aggregator.add_reading(
+                            track.vehicle_id, text, conf, track.visibility
+                        )
+                    consensus_text, consensus_conf = text_aggregator.get_consensus(
+                        track.vehicle_id
+                    )
+                    if consensus_text:
+                        track.update_plate_text(consensus_text, consensus_conf)
+        elif text_aggregator:
+            # Still update consensus even on non-OCR frames (Rekognition may have added readings)
+            for track in active_tracks:
+                if track.frames_since_seen == 0:
                     consensus_text, consensus_conf = text_aggregator.get_consensus(
                         track.vehicle_id
                     )
@@ -347,16 +351,36 @@ def process_video(
         # Draw annotations
         annotated_frame = draw_annotations(frame.copy(), active_tracks)
 
+        # Add stream overlay info
+        if is_stream:
+            elapsed = _time.time() - start_time
+            active_count = sum(
+                1 for t in active_tracks if t.frames_since_seen == 0
+            )
+            overlay = f"LIVE | {elapsed:.0f}s | Vehicles: {active_count} | FPS: {frame_idx / max(elapsed, 0.01):.1f}"
+            cv2.putText(
+                annotated_frame, overlay, (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2,
+            )
+
         # Display progress
         if frame_idx % 30 == 0:
             active_count = sum(
                 1 for t in active_tracks if t.frames_since_seen == 0
             )
-            print(
-                f"\rProcessing frame {frame_idx}/{total_frames} "
-                f"| Active vehicles: {active_count}",
-                end="",
-            )
+            if is_stream:
+                elapsed = _time.time() - start_time
+                print(
+                    f"\r[LIVE] Elapsed: {elapsed:.0f}s | Frame: {frame_idx} "
+                    f"| Active vehicles: {active_count}",
+                    end="",
+                )
+            else:
+                print(
+                    f"\rProcessing frame {frame_idx}/{total_frames} "
+                    f"| Active vehicles: {active_count}",
+                    end="",
+                )
 
         # Write output
         if writer:
@@ -365,7 +389,7 @@ def process_video(
         # Show live preview (resized to fit screen)
         if show:
             display_frame = _resize_for_display(annotated_frame, display_width)
-            cv2.imshow("Vehicle Wait Time Analyzer", display_frame)
+            cv2.imshow("Opus LaneSight", display_frame)
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 print("\nStopped by user.")
                 break
@@ -399,19 +423,33 @@ def process_video(
 
         print_results(all_tracks, fps)
     else:
-        print("No vehicles detected in the video.")
+        print("No vehicles detected.")
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Analyze video to detect vehicles, read plates via OCR, "
-        "track with DeepSORT, and calculate wait times."
+        description="Opus LaneSight — Analyze video or live stream to detect vehicles, "
+        "read plates via OCR, track with DeepSORT, and calculate wait times."
+    )
+
+    # Input source (mutually exclusive: file or stream)
+    input_group = parser.add_mutually_exclusive_group(required=True)
+    input_group.add_argument(
+        "--video", help="Path to input video file (MP4, AVI, etc.)"
+    )
+    input_group.add_argument(
+        "--stream",
+        help="RTSP/RTMP/HTTP stream URL (e.g., rtsp://user:pass@ip:554/stream)",
+    )
+
+    parser.add_argument(
+        "--output", default=None,
+        help="Path to save annotated output video",
     )
     parser.add_argument(
-        "--video", required=True, help="Path to input video file"
-    )
-    parser.add_argument(
-        "--output", default="output.mp4", help="Path to save annotated video"
+        "--no-output",
+        action="store_true",
+        help="Disable saving output video",
     )
     parser.add_argument(
         "--conf",
@@ -450,12 +488,43 @@ def main():
         default=1280,
         help="Width of the display window in pixels (maintains aspect ratio)",
     )
+    parser.add_argument(
+        "--detector",
+        choices=["yolo", "rekognition"],
+        default="yolo",
+        help="Detection backend: 'yolo' (local YOLOv8) or 'rekognition' (AWS API)",
+    )
+    parser.add_argument(
+        "--aws-region",
+        default="us-east-1",
+        help="AWS region for Rekognition API (used with --detector rekognition)",
+    )
+    parser.add_argument(
+        "--detect-interval",
+        type=int,
+        default=1,
+        help="Run detection every N frames (Kalman predicts between). "
+        "Higher values reduce API calls for Rekognition or GPU load for YOLO. "
+        "Default: 1 (every frame). Recommended for Rekognition: 5-10.",
+    )
 
     args = parser.parse_args()
 
+    # Default output path for file mode
+    output = args.output
+    if args.no_output:
+        output = None
+    elif output is None and args.video:
+        output = "output.mp4"
+
+    # For stream mode, auto-enable show if no output specified
+    if args.stream and not args.output and not args.show:
+        args.show = True
+
     process_video(
         video_path=args.video,
-        output_path=args.output,
+        stream_url=args.stream,
+        output_path=output,
         confidence=args.conf,
         show=args.show,
         plate_model_path=args.plate_model,
@@ -463,6 +532,9 @@ def main():
         ocr_interval=args.ocr_interval,
         no_ocr=args.no_ocr,
         display_width=args.display_width,
+        detector_backend=args.detector,
+        aws_region=args.aws_region,
+        detect_interval=args.detect_interval,
     )
 
 
