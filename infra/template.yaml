@@ -32,6 +32,14 @@ Parameters:
     Default: StationStatistics
     Description: DynamoDB table name for the Statistics_Store.
 
+  StationStatsClientCredentials:
+    Type: String
+    Default: ""
+    NoEcho: true
+    Description: >
+      Comma-separated client credentials accepted by the Station Stats API
+      authorizer. Leave empty only for local/demo fallback behavior.
+
 Conditions:
   HasCustomDomain:
     Fn::Not:
@@ -201,6 +209,10 @@ Resources:
       FunctionName: station-stats-authorizer
       CodeUri: ../
       Handler: station_stats_api.lambda_handler.authorizer_handler
+      Environment:
+        Variables:
+          STATION_STATS_CLIENT_CREDENTIALS:
+            Ref: StationStatsClientCredentials
 
   # -------------------------------------------------------------------------
   # Lambda: Snapshot (POST) handler -> wraps handle_snapshot (task 4.1 / 8.2)

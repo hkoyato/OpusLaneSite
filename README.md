@@ -1,249 +1,332 @@
-# Opus LaneSight — Vehicle Wait Time Analyzer
+# Opus LaneSight
 
-AI-powered station wait-time intelligence. Detects vehicles from video clips or live camera streams, locates license plates, reads plate text via OCR, tracks vehicles with DeepSORT, and calculates how long each vehicle is visible in the camera (wait time).
+Opus LaneSight is a prototype for inspection-station wait-time intelligence. It uses standard camera footage to detect and track vehicles, turns those tracks into station-level wait-time metrics, and can publish the latest station snapshot to a small public wait-time display.
 
-## Features
+The repository contains four working pieces:
 
-- Vehicle detection using YOLOv8 (local) or AWS Rekognition (cloud)
-- License plate localization (multi-method: YOLO model, contour, morphology, color)
-- Plate text OCR via EasyOCR with multi-frame voting consensus
-- DeepSORT-style tracking: Kalman filter + appearance re-identification
-- Occlusion-aware tracking with gallery-based re-ID
-- Wait time calculation with statistics
-- Supports both video files and live RTSP/RTMP/HTTP streams
-- Annotated output video with vehicle IDs and plate text overlay
-- Auto-reconnection for unreliable streams
+1. **Video analysis pipeline** — Python CLI and PySide6 desktop app for MP4 files or RTSP/RTMP/HTTP streams.
+2. **Station metrics layer** — deterministic aggregation from tracked vehicles into queue-depth, throughput, active-lane, and public wait estimates.
+3. **Station Stats API** — AWS SAM template for API Gateway, Lambda, and DynamoDB.
+4. **Public dashboard** — static HTML/CSS/JavaScript page that reads the API and shows a motorist-friendly wait-time card.
 
-## Setup
+> Project status: hackathon/demo prototype. It is useful for demos, experiments, and pilot planning, but it is not a production-certified traffic-measurement system.
 
-```bash
-pip install -r requirements.txt
-```
+## What LaneSight does today
 
-### Dependencies
+- Processes video files or live camera streams.
+- Detects vehicles with local YOLOv8 or optional Amazon Rekognition.
+- Tracks vehicles with a DeepSORT-style tracker using Kalman prediction, Hungarian assignment, and appearance re-identification.
+- Calculates how long vehicles remain visible in the observed scene.
+- Computes station metrics from tracked results:
+  - total vehicles
+  - peak concurrent vehicles as the current queue-depth proxy
+  - completed vehicles
+  - manually configured active lanes
+  - average observed cycle duration
+  - estimated public wait time
+  - throughput per hour
+- Runs as either:
+  - a command-line analyzer (`main.py`), or
+  - a branded desktop app (`python -m gui`).
+- Publishes station snapshots to an HTTPS API when configured.
+- Serves a static public dashboard that lists available stations and displays the latest public wait estimate.
 
-| Package | Role |
-|---------|------|
-| `ultralytics` | YOLOv8 local vehicle detection |
-| `opencv-python` | Video I/O, image processing, annotation |
-| `easyocr` | License plate text recognition |
-| `scipy` | Hungarian algorithm for optimal track assignment |
-| `numpy` | Numerical operations |
-| `boto3` | AWS Rekognition API (optional, only for `--detector rekognition`) |
+## What is intentionally not claimed
 
-### AWS Rekognition setup (optional)
-
-Only needed if you want to use `--detector rekognition`:
-
-```bash
-pip install awscli
-aws configure
-```
-
-Required IAM permissions: `rekognition:DetectLabels`, `rekognition:DetectText`.
-
-## Usage
-
-### Input source (required, pick one)
-
-| Flag | Description |
-|------|-------------|
-| `--video PATH` | Path to a video file (MP4, AVI, MKV, MOV, etc.) |
-| `--stream URL` | RTSP/RTMP/HTTP live stream URL |
-
-These are mutually exclusive — use one or the other.
-
-### All options
-
-| Flag | Description | Default |
-|------|-------------|---------|
-| `--video PATH` | Input video file path | — |
-| `--stream URL` | Live stream URL (RTSP/RTMP/HTTP) | — |
-| `--output PATH` | Path to save annotated output video | `output.mp4` (file mode), none (stream mode) |
-| `--no-output` | Disable saving output video entirely | `False` |
-| `--detector {yolo,rekognition}` | Detection backend | `yolo` |
-| `--aws-region REGION` | AWS region for Rekognition | `us-east-1` |
-| `--conf FLOAT` | Detection confidence threshold (0-1) | `0.5` |
-| `--detect-interval N` | Run detection every N frames (Kalman predicts between) | `1` |
-| `--show` | Display live preview window | `False` |
-| `--display-width PX` | Preview window width in pixels (maintains aspect ratio) | `1280` |
-| `--plate-model PATH` | Path to YOLO model for plate detection | None (uses contour fallback) |
-| `--ocr-lang LANG [LANG ...]` | OCR language codes | `en` |
-| `--ocr-interval N` | Run OCR every N frames | `10` |
-| `--no-ocr` | Disable plate text OCR (faster processing) | `False` |
-
-## Command Examples
-
-### Basic video file processing
-
-```bash
-# Process video, save annotated output, show preview
-python main.py --video clip.mp4 --show
-
-# Process without preview (headless)
-python main.py --video clip.mp4
-
-# No output video, just console results
-python main.py --video clip.mp4 --no-output
-
-# Custom output path
-python main.py --video clip.mp4 --output result.mp4
-```
-
-### Live stream
-
-```bash
-# RTSP IP camera
-python main.py --stream rtsp://admin:password@192.168.1.100:554/stream1
-
-# RTMP stream
-python main.py --stream rtmp://server.com/live/channel
-
-# HTTP MJPEG stream
-python main.py --stream http://camera.example.com/video.mjpg
-
-# Stream with recording to file
-python main.py --stream rtsp://192.168.1.100:554/stream --output recording.mp4
-```
-
-### Detection backend
-
-```bash
-# Local YOLOv8 (default, free, fast, needs GPU for best performance)
-python main.py --video clip.mp4 --detector yolo --show
-
-# AWS Rekognition (cloud API, no local GPU needed)
-python main.py --video clip.mp4 --detector rekognition --show
-
-# Rekognition with specific region
-python main.py --video clip.mp4 --detector rekognition --aws-region eu-west-1
-
-# Rekognition with frame skipping to reduce API costs
-python main.py --video clip.mp4 --detector rekognition --detect-interval 5 --show
-```
-
-### Performance tuning
-
-```bash
-# Skip frames for faster processing (tracker predicts between)
-python main.py --video clip.mp4 --detect-interval 3 --show
-
-# Lower confidence threshold (detect more vehicles, may include false positives)
-python main.py --video clip.mp4 --conf 0.3 --show
-
-# Higher confidence (fewer false positives, may miss distant vehicles)
-python main.py --video clip.mp4 --conf 0.7 --show
-
-# Disable OCR for maximum speed
-python main.py --video clip.mp4 --no-ocr --show
-
-# More frequent OCR (better plate reading, slower)
-python main.py --video clip.mp4 --ocr-interval 5 --show
-
-# Less frequent OCR (faster, still aggregates across frames)
-python main.py --video clip.mp4 --ocr-interval 30 --show
-```
-
-### Display options
-
-```bash
-# Smaller preview window (laptop screen)
-python main.py --video clip.mp4 --show --display-width 800
-
-# Larger preview window (external monitor)
-python main.py --video clip.mp4 --show --display-width 1920
-
-# Full HD preview
-python main.py --video clip.mp4 --show --display-width 1920
-```
-
-### OCR language
-
-```bash
-# English plates (default)
-python main.py --video clip.mp4 --ocr-lang en --show
-
-# Chinese + English plates
-python main.py --video clip.mp4 --ocr-lang en ch_sim --show
-
-# Korean plates
-python main.py --video clip.mp4 --ocr-lang en ko --show
-```
-
-### Plate detection model
-
-```bash
-# Use a dedicated YOLO plate detection model (most accurate)
-python main.py --video clip.mp4 --plate-model plate_detect.pt --show
-
-# Without plate model (uses contour/morphology/color fallback)
-python main.py --video clip.mp4 --show
-```
-
-### Combined examples
-
-```bash
-# Full-featured: Rekognition + OCR + stream + recording
-python main.py --stream rtsp://192.168.1.100:554/cam1 \
-  --detector rekognition --aws-region us-west-2 \
-  --detect-interval 5 --ocr-lang en \
-  --output station_recording.mp4 --show --display-width 1280
-
-# Fast local processing: YOLO + no OCR + no output
-python main.py --video clip.mp4 --detector yolo --no-ocr --no-output --show
-
-# Hackathon demo: local YOLO + OCR disabled (privacy-preserving)
-python main.py --video demo_station.mp4 --no-ocr --show --display-width 1280
-```
-
-## Output
-
-### Console output
-
-```
-==========================================================================================
-VEHICLE WAIT TIME ANALYSIS RESULTS
-==========================================================================================
-Vehicle ID  Plate Text      Confidence  Enter (s)   Leave (s)   Wait Time (s)
-------------------------------------------------------------------------------------------
-1           W1771TX         0.84        0.00        10.12       10.12
-2           W36283M         0.99        0.00        6.60        6.60
-3           N/A             -           0.32        2.92        2.60
-4           N/A             -           3.96        6.08        2.12
-==========================================================================================
-Total vehicles tracked: 4
-Average wait time: 5.36s
-Max wait time: 10.12s
-Min wait time: 2.12s
-```
-
-### Annotated video
-
-The output video includes:
-- Green bounding boxes around detected vehicles
-- Vehicle ID labels
-- Blue bounding boxes around detected plates
-- Plate text overlay (when OCR is enabled)
-- Live stream overlay with elapsed time and FPS (stream mode)
+- Lane and zone polygons are not yet implemented; active lane count is an operator setting, and queue depth is currently derived from peak concurrent tracked vehicles.
+- The public wait estimate is a transparent formula, not a machine-learning prediction.
+- License-plate OCR exists for development experiments, but the intended public wait-time workflow keeps OCR disabled and does not require plate identity.
+- Bedrock summaries, historical reporting, multi-camera re-identification, and production station integrations are future work.
 
 ## Architecture
 
+```text
+Video file or camera stream
+        |
+        v
+Vehicle detection
+  - YOLOv8 locally, or
+  - Amazon Rekognition when selected
+        |
+        v
+Vehicle tracking
+  - Kalman prediction
+  - Hungarian assignment
+  - appearance re-identification
+        |
+        v
+Station metrics
+  - queue-depth proxy
+  - average observed cycle time
+  - active lane setting
+  - public wait estimate
+        |
+        +--> Desktop app / CLI results
+        |
+        v
+Station Stats API
+  - API Gateway
+  - Lambda
+  - DynamoDB current station snapshot
+        |
+        v
+Static public dashboard
 ```
-main.py                  CLI entry point, video/stream I/O loop, orchestration
-detector.py              YOLOv8 local vehicle + plate detection
-detector_rekognition.py  AWS Rekognition vehicle + plate detection
-plate_detector.py        Contour/morphology/color plate region detection
-tracker.py               DeepSORT tracker (Kalman + Hungarian + gallery re-ID)
-appearance.py            HSV color histogram feature extractor for re-ID
-ocr.py                   EasyOCR plate reader + multi-frame voting aggregator
+
+## Repository map
+
+| Path | Purpose |
+| --- | --- |
+| `main.py` | CLI entry point for video and stream processing. |
+| `gui/` | PySide6 desktop application, station settings, metrics, and API publishing. |
+| `detector.py` | Local YOLOv8 vehicle detection. |
+| `detector_rekognition.py` | Optional Amazon Rekognition detector. |
+| `tracker.py` | DeepSORT-style vehicle tracker. |
+| `ocr.py`, `plate_detector.py` | Optional plate-region and OCR utilities for development experiments. |
+| `station_stats_api/` | Lambda handlers, validation, storage adapters, and API logic. |
+| `lanesight_client/` | HTTPS snapshot publisher used by the desktop app. |
+| `infra/template.yaml` | AWS SAM template for API Gateway, Lambda, and DynamoDB. |
+| `src/` | Static public wait-time dashboard. |
+| `tests/` | Python and JavaScript tests. |
+
+## Prerequisites
+
+- Python 3.11+ for the local app and tests.
+- Python 3.12-compatible AWS runtime for Lambda deployment.
+- Node.js 20+ and npm for dashboard tests.
+- AWS CLI and AWS SAM CLI for cloud deployment.
+- AWS credentials configured locally when using Rekognition or deploying the API.
+
+## Local setup
+
+```bash
+git clone <repo-url>
+cd "Opus Lanesight"
+
+python -m venv .venv
+# Windows PowerShell:
+.\.venv\Scripts\Activate.ps1
+# macOS/Linux:
+# source .venv/bin/activate
+
+pip install -r requirements.txt
+npm install
 ```
 
-## Privacy note
+The first local YOLO run downloads the default model into `assets/models/` if it is missing.
 
-LaneSight uses temporary anonymous vehicle session IDs for wait-time calculation. License plates and driver identities are not stored. OCR can be fully disabled with `--no-ocr` for privacy-preserving deployments.
+## Run the desktop app
 
-## Keyboard controls
+```bash
+python -m gui
+```
 
-| Key | Action |
-|-----|--------|
-| `q` | Stop processing and show results |
+Typical demo flow:
+
+1. Open **Station** and set the station identifier and display name.
+2. Open **Input** and choose a video file or stream URL.
+3. Keep OCR disabled for the privacy-preserving wait-time workflow.
+4. Choose `yolo` for local processing, or `rekognition` if AWS credentials are configured.
+5. Start processing and review the **Results** view.
+
+The app stores local settings at `%LOCALAPPDATA%\OpusLaneSight\settings.json` on Windows.
+
+## Run the CLI analyzer
+
+```bash
+# Local YOLO, privacy-preserving demo mode
+python main.py --video demo_station.mp4 --no-ocr --show
+
+# Headless file processing with annotated output.mp4
+python main.py --video demo_station.mp4 --no-ocr
+
+# Live stream preview
+python main.py --stream rtsp://camera.example.com/stream --no-ocr --show
+
+# AWS Rekognition detector
+python main.py --video demo_station.mp4 --detector rekognition --aws-region us-west-2 --no-ocr
+
+# Rekognition with adaptive interval/resolution control
+python main.py --video demo_station.mp4 --detector rekognition --auto-adjust --no-ocr --show
+```
+
+Common options:
+
+| Option | Description | Default |
+| --- | --- | --- |
+| `--video PATH` | Analyze a video file. | Required unless `--stream` is used. |
+| `--stream URL` | Analyze an RTSP/RTMP/HTTP stream. | Required unless `--video` is used. |
+| `--output PATH` | Save annotated video. | `output.mp4` for file mode. |
+| `--no-output` | Disable annotated output. | `False` |
+| `--show` | Display a preview window. | `False` for files; auto-enabled for streams without output. |
+| `--detector yolo\|rekognition` | Detection backend. | `yolo` |
+| `--aws-region REGION` | Rekognition region. | `us-east-1` |
+| `--detect-interval N` | Run detection every N frames. | `1` |
+| `--auto-adjust` | Adjust Rekognition interval/resolution based on activity. | `False` |
+| `--no-ocr` | Disable plate OCR. Recommended for public wait-time demos. | `False` |
+| `--ocr-lang LANG...` | EasyOCR language codes when OCR is enabled. | `en` |
+
+Press `q` in the preview window to stop processing.
+
+## Station wait-time formula
+
+The current public estimate is deterministic:
+
+```text
+estimated_public_wait_minutes = queue_depth * average_inspection_minutes / active_lanes
+```
+
+Where:
+
+- `queue_depth` is the peak concurrent tracked-vehicle count in the observed window.
+- `average_inspection_minutes` is currently the average observed vehicle cycle duration because zone-level queue/bay timing is not implemented yet.
+- `active_lanes` is an operator-configured station setting and is floored at 1.
+
+## Station Stats API
+
+The deployed API stores one current snapshot per station.
+
+| Method | Path | Purpose |
+| --- | --- | --- |
+| `POST` | `/stations/{station_id}/snapshot` | Accept a station metric snapshot. |
+| `GET` | `/stations` | List stations that have a current snapshot. |
+| `GET` | `/stations/{station_id}` | Return the latest snapshot for one station. |
+
+All requests require the `X-Client-Credential` header. The prototype authorizer accepts a comma-separated `STATION_STATS_CLIENT_CREDENTIALS` Lambda environment variable. If that variable is not set, the code falls back to the demo credential in `station_stats_api/lambda_handler.py`; do not rely on that fallback for public deployments.
+
+Snapshot body shape:
+
+```json
+{
+  "station_id": "demo_station_01",
+  "timestamp": "2026-06-12T18:00:00Z",
+  "vehicles_in_queue": 4,
+  "vehicles_in_bay": 2,
+  "active_lanes": 2,
+  "average_queue_wait_minutes": 6.2,
+  "average_inspection_minutes": 6.2,
+  "estimated_public_wait_minutes": 12.4,
+  "throughput_per_hour": 19,
+  "slowest_lane_id": null,
+  "confidence_score": 0.82
+}
+```
+
+## Deploy the API with AWS SAM
+
+From the repository root:
+
+```bash
+sam build --template-file infra/template.yaml
+
+sam deploy --guided \
+  --stack-name opus-lanesight-station-stats \
+  --capabilities CAPABILITY_IAM \
+  --parameter-overrides \
+    StageName=prod \
+    TableName=StationStatistics \
+    StationStatsClientCredentials=<replace-with-demo-or-pilot-credential>
+```
+
+After deployment, capture the API URL:
+
+```bash
+sam list stack-outputs --stack-name opus-lanesight-station-stats
+```
+
+Use the `ApiBaseUrl` output as the dashboard `apiBaseUrl` and desktop app API base URL.
+
+Optional custom domain deployment:
+
+```bash
+sam deploy \
+  --stack-name opus-lanesight-station-stats \
+  --capabilities CAPABILITY_IAM \
+  --parameter-overrides \
+    StageName=prod \
+    TableName=StationStatistics \
+    StationStatsClientCredentials=<credential> \
+    DomainName=stats.example.com \
+    CertificateArn=arn:aws:acm:REGION:ACCOUNT:certificate/CERTIFICATE_ID
+```
+
+The custom-domain certificate must be in the same region as the regional API Gateway domain.
+
+## Configure snapshot publishing from the desktop app
+
+The desktop app publishes snapshots only when both API settings are configured. If left blank, processing still works locally and snapshots are not submitted.
+
+Edit `%LOCALAPPDATA%\OpusLaneSight\settings.json` and set:
+
+```json
+{
+  "api_base_url": "https://your-api-id.execute-api.us-west-2.amazonaws.com/prod",
+  "client_credential": "your-demo-or-pilot-credential"
+}
+```
+
+Restart the app after editing the settings file.
+
+## Deploy the public dashboard
+
+The dashboard is static; there is no build step.
+
+1. Create a deployment config:
+
+   ```bash
+   cp src/config.example.js src/config.js
+   ```
+
+2. Edit `src/config.js`:
+
+   ```js
+   window.OPUS_DEMO_CONFIG = {
+     apiBaseUrl: "https://your-api-id.execute-api.us-west-2.amazonaws.com/prod",
+     clientCredential: "your-demo-or-pilot-credential"
+   };
+   ```
+
+3. Run locally:
+
+   ```bash
+   python -m http.server 8080 --directory src
+   ```
+
+   Open `http://localhost:8080`.
+
+4. Publish to S3 and serve with CloudFront for HTTPS:
+
+   ```bash
+   aws s3 mb s3://opus-lanesight-public-dashboard-demo
+   aws s3 sync src/ s3://opus-lanesight-public-dashboard-demo/ --delete
+   ```
+
+   Configure CloudFront with the S3 bucket as the origin and `index.html` as the default root object.
+
+Security note: `src/config.js` is downloaded by every browser visitor. Any credential placed there is public. For a real public deployment, put a server-side backend or edge function between the browser and the protected Station Stats API instead of exposing a write-capable credential in static JavaScript.
+
+## Tests
+
+```bash
+pytest
+npm test
+```
+
+The Python test suite covers the pipeline helpers, desktop app logic, station metrics, API handlers, and client submission behavior. The JavaScript tests cover the public dashboard state, configuration, API client, presentation, and smoke checks.
+
+## Privacy and data handling
+
+- The intended public wait-time workflow uses temporary anonymous vehicle session IDs.
+- OCR is optional and should remain disabled for privacy-preserving demos and pilots.
+- The public dashboard displays aggregate wait-time information only.
+- The Station Stats API stores the latest station metric snapshot, not video frames or vehicle images.
+
+## Roadmap
+
+- Polygon-based lane and zone calibration.
+- Separate queue, bay, and exit timing.
+- Better active-lane detection instead of manual lane count.
+- Production credential storage through AWS Secrets Manager or SSM Parameter Store.
+- CloudFront/API integration that avoids exposing credentials to public browsers.
+- Grounded AI operations summaries from measured station metrics.
+- Historical reporting and multi-station operations views.
