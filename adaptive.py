@@ -51,9 +51,11 @@ class AdaptiveController:
         self.max_resolution = max_resolution
         self.sensitivity = sensitivity
 
-        # Current adaptive values
-        self.current_interval = 5  # Start moderate
-        self.current_resolution = 1280
+        # Current adaptive values — START AGGRESSIVE
+        # Begin at minimum interval (every frame) to catch vehicles immediately.
+        # Only relax once the scene is confirmed stable.
+        self.current_interval = min_interval
+        self.current_resolution = max_resolution
 
         # Activity tracking
         self._prev_vehicle_count = 0
@@ -61,10 +63,12 @@ class AdaptiveController:
         self._activity_history = deque(maxlen=30)  # Last 30 decisions
         self._count_change_history = deque(maxlen=10)
         self._movement_history = deque(maxlen=10)
+        self._frames_processed = 0
+        self._warmup_frames = 60  # Stay aggressive for first 60 frames (~2-3s)
 
         # Thresholds
-        self._high_activity_threshold = 0.6
-        self._low_activity_threshold = 0.2
+        self._high_activity_threshold = 0.4
+        self._low_activity_threshold = 0.15
 
     def update(self, active_tracks):
         """
@@ -86,6 +90,8 @@ class AdaptiveController:
                 'reason': str,  # Human-readable reason for current settings
             }
         """
+        self._frames_processed += 1
+
         # Calculate activity metrics
         current_count = len([t for t in active_tracks if t.frames_since_seen == 0])
         count_change = abs(current_count - self._prev_vehicle_count)
@@ -93,6 +99,33 @@ class AdaptiveController:
 
         self._count_change_history.append(count_change)
         self._movement_history.append(movement)
+
+        # WARMUP PHASE: stay at minimum interval until we've seen enough frames
+        # to understand the scene. This prevents missing vehicles at the start.
+        if self._frames_processed < self._warmup_frames:
+            # Still track activity during warmup so the transition is smooth
+            activity_score = self._compute_activity_score(
+                current_count, count_change, movement
+            )
+            self._activity_history.append(activity_score)
+
+            self._prev_vehicle_count = current_count
+            self._prev_bboxes = [
+                t.bbox for t in active_tracks if t.frames_since_seen == 0
+            ]
+            reason = f"WARMUP ({self._frames_processed}/{self._warmup_frames}) | interval={self.current_interval}f | vehicles={current_count}"
+            return {
+                "detect_interval": self.current_interval,
+                "resolution": self.current_resolution,
+                "reason": reason,
+            }
+
+        # INSTANT REACT: if vehicles just appeared (0 → N), go to max frequency
+        instant_react = (self._prev_vehicle_count == 0 and current_count > 0)
+        if instant_react:
+            self.current_interval = self.min_interval
+            self.current_resolution = self.max_resolution
+            self._activity_history.clear()  # Reset history on major change
 
         # Compute activity score (0 = dead calm, 1 = maximum activity)
         activity_score = self._compute_activity_score(
@@ -103,11 +136,21 @@ class AdaptiveController:
         # Smooth activity over recent history to avoid jitter
         smoothed_activity = np.mean(self._activity_history)
 
-        # Adjust detection interval (inverse of activity)
-        self.current_interval = self._compute_interval(smoothed_activity)
-
-        # Adjust resolution (proportional to activity)
-        self.current_resolution = self._compute_resolution(smoothed_activity)
+        # Skip adaptive computation on instant react frame — keep min interval
+        if not instant_react:
+            if current_count > 0:
+                # Vehicles present: never go above moderate interval
+                max_allowed = min(self.max_interval, max(self.min_interval * 5, 10))
+                self.current_interval = self._compute_interval(smoothed_activity)
+                self.current_interval = min(self.current_interval, max_allowed)
+                # Keep resolution at least moderate when vehicles are being tracked
+                self.current_resolution = self._compute_resolution(smoothed_activity)
+                self.current_resolution = max(self.current_resolution, 960)
+            else:
+                # No vehicles: can relax fully
+                self.current_interval = self._compute_interval(smoothed_activity)
+                self.current_resolution = self._compute_resolution(smoothed_activity)
+        # else: instant_react keeps min_interval and max_resolution as set above
 
         # Store state for next frame
         self._prev_vehicle_count = current_count
