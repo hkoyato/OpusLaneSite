@@ -432,6 +432,19 @@ class InputPanel(QWidget):
         self.rekognition_hint.setVisible(False)
         layout.addWidget(self.rekognition_hint)
 
+        # --- Auto-adjust toggle (Rekognition only) ----------------------
+        self.auto_adjust_toggle = QCheckBox(
+            "Auto-adjust interval and resolution based on scene activity"
+        )
+        self.auto_adjust_toggle.setToolTip(
+            "When enabled, the system automatically increases detection frequency "
+            "when vehicles enter or leave, and reduces it during idle periods to "
+            "save Rekognition API costs. Overrides the manual detection interval."
+        )
+        self.auto_adjust_toggle.toggled.connect(self._on_auto_adjust_toggled)
+        self.auto_adjust_toggle.setVisible(False)
+        layout.addWidget(self.auto_adjust_toggle)
+
         # --- Active lanes (manual station override) ---------------------
         # The single-camera pipeline cannot detect lane count, so the number
         # of active inspection lanes is an operator-set value that feeds the
@@ -530,6 +543,7 @@ class InputPanel(QWidget):
                 max(_DETECT_INTERVAL_MIN, min(_DETECT_INTERVAL_MAX, int(s.detect_interval)))
             )
             self.no_output_toggle.setChecked(bool(s.no_output))
+            self.auto_adjust_toggle.setChecked(bool(getattr(s, "auto_adjust", False)))
             self.active_lanes_spin.setValue(
                 max(_ACTIVE_LANES_MIN, min(_ACTIVE_LANES_MAX, int(s.active_lanes)))
             )
@@ -735,10 +749,13 @@ class InputPanel(QWidget):
             self._clear_error()
 
     def on_detector_backend_changed(self, backend: str) -> None:
-        """Toggle AWS region field and Rekognition hints (Req 12.2/12.3/13.3)."""
+        """Toggle AWS region field, Rekognition hints, and auto-adjust (Req 12.2/12.3/13.3)."""
         is_rekognition = backend == _BACKEND_REKOGNITION
         self.aws_region_widget.setVisible(is_rekognition)
         self.rekognition_hint.setVisible(is_rekognition)
+        self.auto_adjust_toggle.setVisible(is_rekognition)
+        if not is_rekognition:
+            self.auto_adjust_toggle.setChecked(False)
         self._update_privacy_note()
         self._save_settings(detector_backend=self._detector_backend())
 
@@ -749,6 +766,11 @@ class InputPanel(QWidget):
 
     def _on_detect_interval_changed(self, value: int) -> None:
         self._save_settings(detect_interval=int(value))
+
+    def _on_auto_adjust_toggled(self, enabled: bool) -> None:
+        """Toggle adaptive mode; disables manual interval when active."""
+        self.detect_interval_spin.setEnabled(not enabled)
+        self._save_settings(auto_adjust=enabled)
 
     def _on_active_lanes_changed(self, value: int) -> None:
         self._save_settings(active_lanes=int(value))
@@ -815,6 +837,7 @@ class InputPanel(QWidget):
             aws_region=aws_region,
             detect_interval=self.detect_interval_spin.value(),
             no_output=no_output,
+            auto_adjust=self.auto_adjust_toggle.isChecked(),
             active_lanes=self.active_lanes_spin.value(),
         )
 

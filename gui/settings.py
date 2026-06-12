@@ -206,6 +206,9 @@ class SettingsManager:
         # no_output
         no_output = bool(data.get("no_output", False))
 
+        # auto_adjust
+        auto_adjust = bool(data.get("auto_adjust", False))
+
         # active_lanes: operator-configured manual override. Clamp to [1, 99];
         # non-int (incl. bool) falls back to 1. Floored at 1 so the wait-time
         # formula never divides by zero.
@@ -249,6 +252,7 @@ class SettingsManager:
             aws_region=aws_region,
             detect_interval=detect_interval,
             no_output=no_output,
+            auto_adjust=auto_adjust,
             source_mode=source_mode,
             active_lanes=active_lanes,
             station_id=station_id,

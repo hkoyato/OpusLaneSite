@@ -40,12 +40,14 @@ class RekognitionDetector:
         region_name="us-east-1",
         confidence=0.5,
         use_rekognition_text=False,
+        max_image_dimension=1280,
     ):
         self.client = boto3.client("rekognition", region_name=region_name)
         # Rekognition uses 0-100 confidence scale
         self.confidence = confidence * 100
         self.use_rekognition_text = use_rekognition_text
         self.plate_detector = PlateDetector()
+        self.max_image_dimension = max_image_dimension
 
     def detect(self, frame):
         """
@@ -66,8 +68,22 @@ class RekognitionDetector:
         """
         h, w = frame.shape[:2]
 
-        # Encode frame as JPEG for Rekognition API
-        _, jpeg_bytes = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        # Downscale large frames to reduce payload size and API latency.
+        # Rekognition works well at 1280px. Bounding boxes are relative
+        # so they map back to original resolution automatically.
+        send_frame = frame
+        if max(h, w) > self.max_image_dimension:
+            scale = self.max_image_dimension / max(h, w)
+            send_frame = cv2.resize(
+                frame,
+                (int(w * scale), int(h * scale)),
+                interpolation=cv2.INTER_AREA,
+            )
+
+        # Encode as JPEG with moderate quality (reduces payload ~60-70%)
+        _, jpeg_bytes = cv2.imencode(
+            ".jpg", send_frame, [cv2.IMWRITE_JPEG_QUALITY, 80]
+        )
         image_bytes = jpeg_bytes.tobytes()
 
         # Call Rekognition DetectLabels

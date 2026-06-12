@@ -276,6 +276,18 @@ class PipelineAdapter:
                 confidence=config.confidence,
             )
 
+        # Adaptive controller for Rekognition cost optimization
+        self.adaptive = None
+        if getattr(config, "auto_adjust", False) and config.detector_backend == "rekognition":
+            from adaptive import AdaptiveController
+            self.adaptive = AdaptiveController(
+                min_interval=1,
+                max_interval=int(self.fps * 2),
+                min_resolution=640,
+                max_resolution=1920,
+                sensitivity=0.5,
+            )
+
         self.tracker = VehicleTracker(
             iou_threshold=0.3,
             max_lost=int(self.fps * 4),         # Keep tracks alive 4s during occlusion
@@ -328,7 +340,16 @@ class PipelineAdapter:
             (``frames_since_seen == 0``).
         """
         # Detect on interval frames only; predict via Kalman on skipped frames.
-        if frame_idx % self.detect_interval == 0:
+        if self.adaptive:
+            # Adaptive mode: controller decides when to detect
+            should_detect = self.adaptive.should_detect(frame_idx)
+            # Dynamically adjust Rekognition upload resolution
+            if hasattr(self.detector, "max_image_dimension"):
+                self.detector.max_image_dimension = self.adaptive.get_resolution()
+        else:
+            should_detect = (frame_idx % self.detect_interval == 0)
+
+        if should_detect:
             detections = self.detector.detect(frame)
 
             # Extract appearance features for all detections
@@ -361,6 +382,10 @@ class PipelineAdapter:
         else:
             # No detection this frame — tracker predicts using Kalman.
             active_tracks = self.tracker.update([], frame_idx, None)
+
+        # Update adaptive controller with current scene state
+        if self.adaptive:
+            self.adaptive.update(active_tracks)
 
         # Run OCR on plate regions periodically with multi-frame voting
         if self.plate_ocr and frame_idx % self.ocr_interval == 0:

@@ -11,7 +11,7 @@ import numpy as np
 import easyocr
 from collections import Counter
 
-from plate_utils import normalize_plate, edit_distance, align_partial_plates
+from plate_utils import normalize_plate, edit_distance
 
 
 class PlateOCR:
@@ -351,13 +351,6 @@ class PlateTextAggregator:
 
         # Pick the group with highest total weighted score
         best_group = max(groups, key=lambda g: g["score"])
-
-        # Try partial plate stitching within the best group
-        group_texts = [t for t, _, _ in best_group["all_texts"]]
-        if len(group_texts) >= 2:
-            stitched = align_partial_plates(group_texts)
-            if len(stitched) > len(best_group["text"]):
-                best_group["text"] = stitched
 
         return best_group["text"], best_group["confidence"]
 

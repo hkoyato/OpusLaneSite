@@ -15,6 +15,7 @@ from detector_rekognition import RekognitionDetector
 from tracker import VehicleTracker
 from ocr import PlateOCR, PlateTextAggregator
 from appearance import AppearanceExtractor
+from adaptive import AdaptiveController
 from plate_utils import plates_are_similar, normalize_plate, edit_distance, pick_best_plate
 
 
@@ -169,6 +170,7 @@ def process_video(
     detector_backend,
     aws_region,
     detect_interval,
+    auto_adjust,
 ):
     """Main processing pipeline. Handles both file and live stream input."""
     import time as _time
@@ -206,7 +208,9 @@ def process_video(
         print(f"Video: {source}")
         print(f"Resolution: {width}x{height}, FPS: {fps:.1f}, Frames: {total_frames}")
     print(f"OCR: {'disabled' if no_ocr else f'enabled (languages={ocr_languages}, interval={ocr_interval} frames)'}")
-    if detect_interval > 1:
+    if auto_adjust and detector_backend == "rekognition":
+        print("Detection: adaptive (auto-adjusting interval and resolution)")
+    elif detect_interval > 1:
         print(f"Detection interval: every {detect_interval} frames (Kalman prediction between)")
     print()
 
@@ -240,6 +244,20 @@ def process_video(
     )
 
     appearance_extractor = AppearanceExtractor(feature_dim=128)
+
+    # Adaptive controller for Rekognition cost optimization
+    adaptive = None
+    if auto_adjust and detector_backend == "rekognition":
+        adaptive = AdaptiveController(
+            min_interval=1,
+            max_interval=int(fps * 2),  # Max 2 seconds between detections
+            min_resolution=640,
+            max_resolution=1920,
+            sensitivity=0.5,
+        )
+        print("Adaptive mode: ON (auto-adjusting interval and resolution)")
+    elif auto_adjust:
+        print("Note: --auto-adjust only applies to Rekognition backend, ignored.")
 
     # Always create aggregator when Rekognition is the backend (it reads text for free)
     plate_ocr = None
@@ -293,7 +311,14 @@ def process_video(
         reconnect_attempts = 0  # Reset on successful read
 
         # Detect vehicles and plates (skip frames to reduce API/GPU load)
-        run_detection = (frame_idx % detect_interval == 0)
+        if adaptive:
+            # Adaptive mode: controller decides when to detect
+            run_detection = adaptive.should_detect(frame_idx)
+            # Update Rekognition detector resolution dynamically
+            if hasattr(detector, "max_image_dimension"):
+                detector.max_image_dimension = adaptive.get_resolution()
+        else:
+            run_detection = (frame_idx % detect_interval == 0)
 
         if run_detection:
             detections = detector.detect(frame)
@@ -327,6 +352,10 @@ def process_video(
         else:
             # No detection this frame — tracker predicts using Kalman
             active_tracks = tracker.update([], frame_idx, None)
+
+        # Update adaptive controller with current scene state
+        if adaptive:
+            adapt_result = adaptive.update(active_tracks)
 
         # Run EasyOCR on plate regions periodically (skip if Rekognition already read text)
         if plate_ocr and frame_idx % ocr_interval == 0:
@@ -365,6 +394,14 @@ def process_video(
             cv2.putText(
                 annotated_frame, overlay, (10, 30),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2,
+            )
+
+        # Add adaptive mode overlay
+        if adaptive and show:
+            adapt_text = f"AUTO | interval={adaptive.current_interval}f | res={adaptive.current_resolution}px"
+            cv2.putText(
+                annotated_frame, adapt_text, (10, 60 if is_stream else 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 1,
             )
 
         # Display progress
@@ -504,6 +541,13 @@ def main():
         help="AWS region for Rekognition API (used with --detector rekognition)",
     )
     parser.add_argument(
+        "--auto-adjust",
+        action="store_true",
+        help="Automatically adjust detection interval and resolution based on "
+        "scene activity (Rekognition only). Saves API costs during idle periods, "
+        "increases frequency when vehicles enter/leave.",
+    )
+    parser.add_argument(
         "--detect-interval",
         type=int,
         default=1,
@@ -539,6 +583,7 @@ def main():
         detector_backend=args.detector,
         aws_region=args.aws_region,
         detect_interval=args.detect_interval,
+        auto_adjust=args.auto_adjust,
     )
 
 

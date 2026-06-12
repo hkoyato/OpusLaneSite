@@ -29,6 +29,7 @@ class ProcessingConfig:
     aws_region: str = "us-east-1"  # used when detector_backend == "rekognition"
     detect_interval: int = 1  # 1 – 60
     no_output: bool = False  # mirrors output_path is None (Req 15)
+    auto_adjust: bool = False  # adaptive interval/resolution (Rekognition only)
     # Operator-configured number of active inspection lanes. The vision
     # pipeline cannot detect lanes from a single camera, so this is a manual
     # station override (product overview §14) that feeds the deterministic
@@ -105,6 +106,7 @@ class AppSettings:
     aws_region: str = "us-east-1"  # 1 – 64 chars
     detect_interval: int = 1  # 1 – 60
     no_output: bool = False
+    auto_adjust: bool = False  # adaptive interval/resolution (Rekognition only)
     source_mode: str = "file"  # "file" | "stream"
     # Operator-configured active inspection lanes (manual station override).
     active_lanes: int = 1  # 1 – 99
